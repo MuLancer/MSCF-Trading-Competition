@@ -30,7 +30,25 @@ Mac 上的脚本连不到 Windows 上的 Client。所以：**代码和 Client �
 
 ## 一、一次性设置（Windows，做一次就行）
 
-1. **装 RIT Client**（Rotman 提供的安装包），启动后按上面的 host/port/凭证登录一次，确认能看到行情在跳。
+1. **装 RIT Client**（只有 Windows 版才提供 `localhost:9999` 的 REST API）
+
+   - 下载页：<https://www.rotman.utoronto.ca/faculty-and-research/education-labs/bmo-financial-group-finance-research-and-trading-lab/rit-market-simulator/rit-downloads/>
+   - 官方操作手册（有截图）：<https://rotmanfrtl.github.io/RIT%20User%20Application%20(RIT%20Client)%20Feature%20Guide.pdf>
+
+   装好启动后，在登录框里填：
+
+   | 字段 | 值 |
+   | --- | --- |
+   | Server / Host | `flserver.rotman.utoronto.ca` |
+   | Port | `16590` |
+   | User / Trader ID | 邮件里发的（练习是 `tqdu-1`） |
+   | Password | 邮件里发的 |
+
+   登录成功的判断标准：能看到 RTM 和 10 个期权的行情在跳。只是界面打开不算。
+
+   > 不想装东西先试试的话，浏览器版在 <https://client.rotmanrit.com:14980/>，
+   > 也有 Mac app。但**这两个走的是 DMA（16595），不提供 localhost:9999**，
+   > 所以只能用来看行情和人工下单，跑不了 REST 脚本。
 2. **装 Python 3.11 或更高**。安装时务必勾选 **Add Python to PATH**。
 3. **拿代码**：
 

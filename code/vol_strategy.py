@@ -10,6 +10,8 @@ so the case logic is unchanged.
 Requires the RIT Client to be running and logged in on this machine.
 """
 
+import base64
+import os
 import re
 import signal
 from time import sleep
@@ -19,8 +21,29 @@ from py_vollib.black_scholes.greeks.analytical import delta as bs_delta
 from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_iv
 
 # ---------------------------------------------------------------- connection
-API_ENDPOINT = "http://localhost:9999/v1"
-AUTHORIZATION = {"X-API-Key": "Rotman"}
+# "dma"    - talks to the Rotman server directly. Any OS, no Client needed.
+#            The browser client and the Mac app also use this port; neither of
+#            them opens localhost:9999, so DMA is the only option off Windows.
+# "client" - talks to the RIT Client's own API on this machine. Requires the
+#            Windows desktop Client installed, running and logged in (it is
+#            what serves localhost:9999). Rotman recommends this one.
+MODE = "dma"
+
+PRACTICE_HOST = "flserver.rotman.utoronto.ca"
+DMA_PORT = 16595              # Volatility case, browser/Mac App port
+CLIENT_PORT = 16590           # Volatility case, port the Windows Client logs into
+
+if MODE == "client":
+    API_ENDPOINT = "http://localhost:9999/v1"
+    AUTHORIZATION = {"X-API-Key": os.environ.get("RIT_API_KEY", "Rotman")}
+else:
+    USERNAME = os.environ.get("RIT_USER", "tqdu-1")
+    PASSWORD = os.environ.get("RIT_PASS", "invoice")
+    API_ENDPOINT = f"http://{PRACTICE_HOST}:{DMA_PORT}/v1"
+    AUTHORIZATION = {
+        "Authorization": "Basic "
+        + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+    }
 
 # ----------------------------------------------------------------- constants
 CONTRACT_SIZE = 100          # shares per option contract
