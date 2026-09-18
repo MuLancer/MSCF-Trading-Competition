@@ -176,6 +176,43 @@ def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):
     print("PASS  hedge_delta_respects_band_and_chunks")
 
 
+def test_news_parsing_real_server_text():
+    """Verbatim items captured from the live server, headlines included.
+
+    Both traps here were invisible to synthetic fixtures: the opening item
+    states the risk-free rate before the volatility, and its headline also
+    contains the word "volatility"; the range item spells the range with
+    "and", not the hyphen used in the case handout.
+    """
+    opening = {
+        "headline": "Risk free rate and current annualized volatility of RTM",
+        "body": "The current risk free rate is 0%. RTM is an ETF that mimics one of "
+                "the major indices in the simulated world and its current annualized "
+                "realized volatility is 12%. This simulation consists of 20 trading "
+                "days that are each 15 ticks in length.",
+    }
+    forecast = {
+        "headline": "News 1",
+        "body": "The analysts have informed you that the realized volatility of RTM "
+                "next week will be between 31% and 36%",
+    }
+    weekly = {
+        "headline": "Announcement 1",
+        "body": "The analysts have informed you that the realized volatility of RTM "
+                "this week will be 31%",
+    }
+
+    assert vs.parse_vol_from_news(opening) == ("this", 0.12), "grabbed the risk-free rate"
+    assert vs.parse_vol_from_news(forecast) == ("next", (0.31, 0.36))
+    assert vs.parse_vol_from_news(weekly) == ("this", 0.31)
+
+    # handout also documents the hyphen form
+    assert vs.parse_vol_from_news(
+        {"headline": "", "body": "realized volatility next week will be between 27-30%"}
+    ) == ("next", (0.27, 0.30))
+    print("PASS  news_parsing_real_server_text")
+
+
 def test_news_parsing_and_state():
     assert vs.parse_vol_from_news(
         {"headline": "Vol", "body": "The realized volatility of RTM for this week will be 20%"}

@@ -110,8 +110,16 @@ def get_securities(session):
 
 
 # ------------------------------------------------- module A: volatility state
-VOL_RANGE_RE = re.compile(r"between\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*%", re.I)
-VOL_SINGLE_RE = re.compile(r"(?:be|is)\s+(\d+(?:\.\d+)?)\s*%", re.I)
+# Both patterns anchor on the word "volatility" and stay inside its sentence.
+# Without that anchor the opening announcement ("The current risk free rate is
+# 0%. ... realized volatility is 18%") matches the risk-free rate and sets the
+# forecast to zero. The live server writes ranges as "between 21% and 26%",
+# not the "21-26%" form used in the case handout, so accept both.
+VOL_RANGE_RE = re.compile(
+    r"volatilit\w*[^.]*?between\s+(\d+(?:\.\d+)?)\s*%?\s*(?:and|to|-)\s*(\d+(?:\.\d+)?)\s*%",
+    re.I)
+VOL_SINGLE_RE = re.compile(
+    r"volatilit\w*[^.]*?(?:is|be)\s+(\d+(?:\.\d+)?)\s*%", re.I)
 
 
 def new_vol_state(initial_vol=0.20):
@@ -128,14 +136,19 @@ def get_new_news(session, last_news_id):
 
 def parse_vol_from_news(item):
     """-> ('this', 0.29) | ('next', (0.27, 0.30)) | None. Already divided by 100."""
-    text = f"{item.get('headline', '')} {item.get('body', '')}"
-    scope = "next" if re.search(r"next\s+week", text, re.I) else "this"
-    m = VOL_RANGE_RE.search(text)
-    if m:
-        return scope, (float(m.group(1)) / 100, float(m.group(2)) / 100)
-    m = VOL_SINGLE_RE.search(text)
-    if m:
-        return scope, float(m.group(1)) / 100
+    headline = item.get("headline") or ""
+    body = item.get("body") or ""
+    scope = "next" if re.search(r"next\s+week", f"{headline} {body}", re.I) else "this"
+    # Search the fields separately. Concatenated, the opening item's headline
+    # ("...annualized volatility of RTM") bridges into the body's first
+    # sentence ("The current risk free rate is 0%") and yields 0%.
+    for text in (body, headline):
+        m = VOL_RANGE_RE.search(text)
+        if m:
+            return scope, (float(m.group(1)) / 100, float(m.group(2)) / 100)
+        m = VOL_SINGLE_RE.search(text)
+        if m:
+            return scope, float(m.group(1)) / 100
     return None
 
 

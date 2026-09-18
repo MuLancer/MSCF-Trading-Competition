@@ -5,9 +5,32 @@ Mac 上的脚本连不到 Windows 上的 Client。所以：**代码和 Client �
 
 ---
 
+## 零、连接信息
+
+**练习服务器**（2026-09-11 12PM 起启用，**竞赛日当天关闭**）：
+
+| 案例 | Windows RIT Client | Browser / Mac App (DMA) |
+| --- | --- | --- |
+| Volatility Trading | `flserver.rotman.utoronto.ca:16590` | `:16595` |
+| Algorithmic ETF Arb | `flserver.rotman.utoronto.ca:16630` | `:16635` |
+
+**同一个案例两个端口,别搞混**：RIT Client 登录用 **16590**，DMA/浏览器用 16595。
+用 16595 去登 Client 是连不上的。
+
+登录 RIT Client 填：host `flserver.rotman.utoronto.ca`、port `16590`、Trader ID 和 Password
+（练习服务器用邮件里发的那组；练习凭证是 `tqdu-1`）。
+
+> **竞赛日**：练习服务器会被关闭，竞赛端口只在当天开放，
+> 并且主办方会另发一组竞赛专用的 Trader ID 和 Password。
+> 当天第一件事是把新的 host / port / 凭证填进去，不要沿用练习的。
+
+主办方明确推荐 **Client-based REST API**（比 DMA 更稳定），所以 Windows + RIT Client + REST 是对的路线。
+
+---
+
 ## 一、一次性设置（Windows，做一次就行）
 
-1. **装 RIT Client**（Rotman 提供的安装包），启动后用 trader ID 登录一次，确认能看到行情。
+1. **装 RIT Client**（Rotman 提供的安装包），启动后按上面的 host/port/凭证登录一次，确认能看到行情在跳。
 2. **装 Python 3.11 或更高**。安装时务必勾选 **Add Python to PATH**。
 3. **拿代码**：
 
