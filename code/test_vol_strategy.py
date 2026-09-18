@@ -155,7 +155,9 @@ def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):
         return {}
 
     original = vs.api_request
+    original_dry = vs.DRY_RUN
     vs.api_request = fake_api_request
+    vs.DRY_RUN = False          # exercise the real order path, not the dry-run stub
     try:
         assert vs.hedge_delta(None, 4000) is False and not calls    # inside band
         assert vs.hedge_delta(None, -4999) is False and not calls
@@ -170,6 +172,7 @@ def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):
         assert all(c["action"] == "BUY" for c in calls)
     finally:
         vs.api_request = original
+        vs.DRY_RUN = original_dry
     print("PASS  hedge_delta_respects_band_and_chunks")
 
 

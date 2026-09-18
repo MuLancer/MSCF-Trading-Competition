@@ -47,6 +47,10 @@ MAX_NEW_TRADES_PER_TICK = 2
 UNDERLYING = "RTM"
 LOOP_SLEEP = 0.25            # Client buffers for us, so this can be tighter than DMA
 
+# Log what would be sent instead of sending it. Run the first heat with this
+# on, confirm the signals and hedges look sane, then flip it off.
+DRY_RUN = True
+
 shutdown = False
 
 
@@ -217,6 +221,9 @@ def select_trades(rows, threshold=IV_GAP_THRESHOLD):
 def place_order(session, ticker, action, qty):
     if qty <= 0:
         return False
+    if DRY_RUN:
+        print(f"    [DRY] {action:4} {int(qty):>6} {ticker}")
+        return True
     resp = api_request(session, "POST", "orders",
                        params={"ticker": ticker, "type": "MARKET",
                                "quantity": int(qty), "action": action})
