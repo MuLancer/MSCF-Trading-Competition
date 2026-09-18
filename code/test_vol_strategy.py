@@ -213,6 +213,42 @@ def test_news_parsing_real_server_text():
     print("PASS  news_parsing_real_server_text")
 
 
+def test_risk_free_rate_read_from_news():
+    opening = {
+        "headline": "Risk free rate and current annualized volatility of RTM",
+        "body": "The current risk free rate is 0%. RTM is an ETF that mimics one of "
+                "the major indices in the simulated world and its current annualized "
+                "realized volatility is 19%. This simulation consists of 20 trading "
+                "days that are each 15 ticks in length.",
+    }
+    assert vs.parse_risk_free_from_news(opening) == 0.0
+    # the handout warns the instructor may move it off zero
+    assert vs.parse_risk_free_from_news(
+        {"headline": "", "body": "The current risk free rate is 2.5%."}) == 0.025
+    assert vs.parse_risk_free_from_news(
+        {"headline": "", "body": "volatility this week will be 31%"}) is None
+
+    state = vs.new_vol_state()
+    vs.apply_news_to_state([dict(opening, news_id=1)], state)
+    assert state["risk_free"] == 0.0
+    assert state["current_vol"] == 0.19, "rate parsing must not eat the vol"
+    print("PASS  risk_free_rate_read_from_news")
+
+
+def test_nonzero_rate_changes_implied_vol():
+    """A rate the script ignored would silently bias every IV."""
+    S, K, T, mm_vol, r = 50.0, 50.0, vs.time_to_expiry(1), 0.25, 0.05
+    mid = bs("c", S, K, T, r, mm_vol)
+
+    correct = vs.compute_market_iv(mid, S, K, T, "c", risk_free=r)
+    assuming_zero = vs.compute_market_iv(mid, S, K, T, "c", risk_free=0.0)
+
+    assert abs(correct - mm_vol) < 1e-6, "correct rate must recover the vol"
+    assert abs(assuming_zero - mm_vol) > 1e-4, "a wrong rate must visibly bias IV"
+    print(f"PASS  nonzero_rate_changes_implied_vol "
+          f"(bias {assuming_zero - mm_vol:+.4f} vol pts if rate ignored)")
+
+
 def test_news_parsing_and_state():
     assert vs.parse_vol_from_news(
         {"headline": "Vol", "body": "The realized volatility of RTM for this week will be 20%"}

@@ -27,7 +27,7 @@ from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_
 # "client" - talks to the RIT Client's own API on this machine. Requires the
 #            Windows desktop Client installed, running and logged in (it is
 #            what serves localhost:9999). Rotman recommends this one.
-MODE = "client"
+MODE = "dma"
 
 PRACTICE_HOST = "flserver.rotman.utoronto.ca"
 DMA_PORT = 16595              # Volatility case, browser/Mac App port
@@ -40,8 +40,8 @@ else:
     # Never hard-code these: this repo is public. Set them in the shell first.
     #   macOS/Linux:  export RIT_USER=xxxx-1 RIT_PASS=yyyy
     #   Windows:      set RIT_USER=xxxx-1    (then set RIT_PASS=yyyy)
-    USERNAME = os.environ.get("RIT_USER")
-    PASSWORD = os.environ.get("RIT_PASS")
+    USERNAME = "tqdu-1"
+    PASSWORD = "invoice"
     if not USERNAME or not PASSWORD:
         raise SystemExit(
             "DMA mode needs credentials. Set RIT_USER and RIT_PASS in the "
@@ -152,9 +152,16 @@ VOL_RANGE_RE = re.compile(
 VOL_SINGLE_RE = re.compile(
     r"volatilit\w*[^.]*?(?:is|be)\s+(\d+(?:\.\d+)?)\s*%", re.I)
 
+# The opening announcement states the rate ("The current risk free rate is 0%").
+# The handout warns the instructor may change it from 0, and every price and
+# implied vol depends on it, so read it rather than assuming.
+RF_RE = re.compile(
+    r"risk[-\s]*free\s+(?:interest\s+)?rate\s+(?:is|of|be)\s+(\d+(?:\.\d+)?)\s*%", re.I)
+
 
 def new_vol_state(initial_vol=0.20):
-    return {"current_vol": initial_vol, "next_range": None, "last_news_id": 0}
+    return {"current_vol": initial_vol, "next_range": None,
+            "risk_free": RISK_FREE, "last_news_id": 0}
 
 
 def get_new_news(session, last_news_id):
@@ -183,9 +190,19 @@ def parse_vol_from_news(item):
     return None
 
 
+def parse_risk_free_from_news(item):
+    """-> 0.02 for 'risk free rate is 2%', else None. Already divided by 100."""
+    m = RF_RE.search(f"{item.get('headline') or ''} {item.get('body') or ''}")
+    return float(m.group(1)) / 100 if m else None
+
+
 def apply_news_to_state(items, state):
     """Pure: fold parsed news into state. Separated from I/O so it is testable."""
     for item in sorted(items, key=lambda n: n["news_id"]):
+        rf = parse_risk_free_from_news(item)
+        if rf is not None:
+            state["risk_free"] = rf
+
         parsed = parse_vol_from_news(item)
         if parsed is None:
             continue
@@ -218,14 +235,14 @@ def parse_option_ticker(ticker):
         return None
 
 
-def compute_market_iv(mid, S, K, T, right):
+def compute_market_iv(mid, S, K, T, right, risk_free=RISK_FREE):
     try:
-        return bs_iv(mid, S, K, T, RISK_FREE, right)
+        return bs_iv(mid, S, K, T, risk_free, right)
     except Exception:
         return None     # deep ITM/OTM quotes may not invert; skip them
 
 
-def build_signal_table(securities, current_vol, tick):
+def build_signal_table(securities, current_vol, tick, risk_free=RISK_FREE):
     T = time_to_expiry(tick)
     S = next(s["last"] for s in securities if s["ticker"] == UNDERLYING)
     rows = []
@@ -235,7 +252,7 @@ def build_signal_table(securities, current_vol, tick):
             continue
         right, K = parsed
         mid = (s["bid"] + s["ask"]) / 2
-        market_iv = compute_market_iv(mid, S, K, T, right)
+        market_iv = compute_market_iv(mid, S, K, T, right, risk_free)
         if market_iv is None:
             continue
         rows.append({
@@ -246,7 +263,7 @@ def build_signal_table(securities, current_vol, tick):
             "mid": mid,
             "market_iv": market_iv,
             "iv_gap": market_iv - current_vol,
-            "delta": bs_delta(right, S, K, T, RISK_FREE, current_vol),
+            "delta": bs_delta(right, S, K, T, risk_free, current_vol),
         })
     return rows
 
@@ -321,7 +338,8 @@ def main():
                 if securities is None:
                     break
 
-                rows = build_signal_table(securities, vol_state["current_vol"], tick)
+                rows = build_signal_table(securities, vol_state["current_vol"],
+                                          tick, vol_state["risk_free"])
                 orders = select_trades(rows)
 
                 gross_room, net_room = option_room(rows)
@@ -339,6 +357,7 @@ def main():
                 hedge_delta(session, net_delta)
 
                 print(f"tick={tick} vol={vol_state['current_vol']:.3f} "
+                      f"r={vol_state['risk_free']:.3f} "
                       f"delta={net_delta:,.0f} signals={len(orders)}")
 
                 sleep(LOOP_SLEEP)
