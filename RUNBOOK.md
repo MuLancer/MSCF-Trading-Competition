@@ -1,121 +1,121 @@
-# 运行手册 — 波动率交易案例
+# 运行手册 — 波动率交易案例（Windows + RIT Client REST API）
 
-脚本必须和 RIT Client 跑在**同一台 Windows 机器**上。Client 的 REST API 只监听 `localhost:9999`，
-Mac 上的脚本连不到 Windows 上的 Client。所以：**代码和 Client 都在 Windows，Mac 只用来写代码和 push。**
+主办方推荐这条路线（比 DMA 稳定）。**脚本和 RIT Client 必须在同一台 Windows 机器上**——
+Client 只在本机开 `localhost:9999`，Mac 上的脚本连不到 Windows 上的 Client。
+
+> 浏览器版 RIT 和 Mac app **不会**开 `localhost:9999`，它们走 DMA。
+> 登录浏览器版对 REST 脚本没有任何帮助。
 
 ---
 
 ## 零、连接信息
 
-**练习服务器**（2026-09-11 12PM 起启用，**竞赛日当天关闭**）：
+**练习服务器**（竞赛日当天会关闭）：
 
 | 案例 | Windows RIT Client | Browser / Mac App (DMA) |
 | --- | --- | --- |
-| Volatility Trading | `flserver.rotman.utoronto.ca:16590` | `:16595` |
-| Algorithmic ETF Arb | `flserver.rotman.utoronto.ca:16630` | `:16635` |
+| Volatility Trading | **16590** | 16595 |
+| Algorithmic ETF Arb | **16630** | 16635 |
 
-**同一个案例两个端口,别搞混**：RIT Client 登录用 **16590**，DMA/浏览器用 16595。
-用 16595 去登 Client 是连不上的。
+Host 都是 `flserver.rotman.utoronto.ca`。
 
-登录 RIT Client 填：host `flserver.rotman.utoronto.ca`、port `16590`、Trader ID 和 Password
-（练习服务器用邮件里发的那组；练习凭证是 `tqdu-1`）。
+**同一个案例两个端口，别搞混**：Client 登录用 **16590**，16595 是给浏览器/Mac app 的。
 
-> **竞赛日**：练习服务器会被关闭，竞赛端口只在当天开放，
-> 并且主办方会另发一组竞赛专用的 Trader ID 和 Password。
-> 当天第一件事是把新的 host / port / 凭证填进去，不要沿用练习的。
-
-主办方明确推荐 **Client-based REST API**（比 DMA 更稳定），所以 Windows + RIT Client + REST 是对的路线。
+> **竞赛日**：练习服务器关闭，竞赛端口只在当天开放，主办方另发一组竞赛专用
+> Trader ID 和 Password。当天第一件事是换 host / port / 凭证，不要沿用练习的。
 
 ---
 
-## 一、一次性设置（Windows，做一次就行）
+## 一、Windows 一次性设置
 
-1. **装 RIT Client**（只有 Windows 版才提供 `localhost:9999` 的 REST API）
+### 1. 装 RIT Client
 
-   - 下载页：<https://www.rotman.utoronto.ca/faculty-and-research/education-labs/bmo-financial-group-finance-research-and-trading-lab/rit-market-simulator/rit-downloads/>
-   - 官方操作手册（有截图）：<https://rotmanfrtl.github.io/RIT%20User%20Application%20(RIT%20Client)%20Feature%20Guide.pdf>
+- 下载页：<https://www.rotman.utoronto.ca/faculty-and-research/education-labs/bmo-financial-group-finance-research-and-trading-lab/rit-market-simulator/rit-downloads/>
+- 官方操作手册（有截图）：<https://rotmanfrtl.github.io/RIT%20User%20Application%20(RIT%20Client)%20Feature%20Guide.pdf>
 
-   装好启动后，在登录框里填：
+### 2. 登录 Client
 
-   | 字段 | 值 |
-   | --- | --- |
-   | Server / Host | `flserver.rotman.utoronto.ca` |
-   | Port | `16590` |
-   | User / Trader ID | 邮件里发的（练习是 `tqdu-1`） |
-   | Password | 邮件里发的 |
+| 字段 | 值 |
+| --- | --- |
+| Server / Host | `flserver.rotman.utoronto.ca` |
+| Port | **`16590`** |
+| User / Trader ID | 邮件里发的 |
+| Password | 邮件里发的 |
 
-   登录成功的判断标准：能看到 RTM 和 10 个期权的行情在跳。只是界面打开不算。
+**登录成功的判断标准：能看到 RTM 和 10 个期权的行情在跳。** 界面打开不算。
+`localhost:9999` 只有在 Client 真正连上案例之后才开始服务——之前的 401 就是这个原因。
 
-   > 不想装东西先试试的话，浏览器版在 <https://client.rotmanrit.com:14980/>，
-   > 也有 Mac app。但**这两个走的是 DMA（16595），不提供 localhost:9999**，
-   > 所以只能用来看行情和人工下单，跑不了 REST 脚本。
-2. **装 Python 3.11 或更高**。安装时务必勾选 **Add Python to PATH**。
-3. **拿代码**：
+### 3. 装 Python 环境
 
-   ```
-   git clone https://github.com/MuLancer/MSCF-Trading-Competition.git
-   cd MSCF-Trading-Competition/code
-   ```
+装 Python 3.11+，安装时**务必勾选 Add Python to PATH**。然后：
 
-4. **装依赖**：
+```
+git clone https://github.com/MuLancer/MSCF-Trading-Competition.git
+cd MSCF-Trading-Competition\code
+pip install -r requirements.txt
+```
 
-   ```
-   pip install -r requirements.txt
-   ```
+### 4. 确认环境没问题（不需要 Client）
 
-5. **验证装好了**（不需要 Client 开着）：
+```
+python test_vol_strategy.py
+```
 
-   ```
-   python test_vol_strategy.py
-   ```
+应该看到 14 个 PASS。任何 FAIL 都先解决再往下走。
 
-   应该看到 13 个 PASS。任何一个 FAIL 都说明环境有问题，先解决再往下走。
+### 5. 确认 MODE
+
+打开 `code\vol_strategy.py`，确认顶部是：
+
+```python
+MODE = "client"
+```
+
+这是默认值，Windows 上不用改，也不需要设任何环境变量。
 
 ---
 
-## 二、赛前测试流程（最关键，别留到当天）
+## 二、赛前测试（用练习服务器，别留到当天）
 
-**前提：RIT Client 已启动、已登录、已连上一个练习案例。**
+**前提：Client 已登录 16590 并且能看到行情在跳。**
 
-### 第 1 步：验证连通性和字段名 ← 最重要
+### 第 1 步：验证连通和字段名
 
 ```
 jupyter notebook test_news.ipynb
 ```
 
-依次跑 cell，重点看两个：
+从上往下跑。cell 2 出现 `HTTP 200` 就说明 REST 通了。重点看：
 
-- **cell 3**（`/news` 返回）：字段名必须是 `news_id / period / tick / ticker / headline / body`
-- **cell 6**（`/securities` 返回）：必须有 `ticker / last / bid / ask / position`
+- **cell 4**：`/news` 字段应为 `news_id / period / tick / ticker / headline / body`
+- **cell 6**：波动率解析结果，每条公告都应该解析出数字而不是 `None`
+- **cell 7**：`/securities` 必须含 `ticker / last / bid / ask / position`
 
-**如果字段名对不上，`vol_strategy.py` 会直接 KeyError。** 这是唯一一个只能在真机上发现的问题，
-务必在比赛前跑通。字段名不一样就告诉我，改起来很快。
-
-cell 5 会用真实新闻文本测波动率解析 —— 确认能正确抽出百分比。
+字段名对不上就先别跑主脚本，告诉我，改起来很快。
 
 ### 第 2 步：空跑一整场
 
-`vol_strategy.py` 顶部的 `DRY_RUN = True`（默认就是），这时脚本只打印要下的单，**不会真的下单**。
+`vol_strategy.py` 顶部 `DRY_RUN = True`（默认），这时只打印要下的单，**不会真下单**。
 
 ```
 python vol_strategy.py
 ```
 
-启动一个练习案例，让它跑完整 300 tick，盯这几件事：
+启动一个练习案例跑满 300 tick，盯四件事：
 
-- `vol=` 有没有随着新闻公告变化（不变说明新闻解析没生效）
-- `signals=` 数量是否合理（一直是 0 说明阈值太高；一直是 10 说明太低）
+- `vol=` 有没有随新闻变化（不变说明新闻没解析到）
+- `signals=` 数量（一直 0 说明阈值太高；一直 10 说明太低）
 - `delta=` 有没有被拉回 ±5000 以内
-- `[DRY]` 那些行的方向对不对（波动率被高估时应该是 SELL）
+- `[DRY]` 行的方向对不对（波动率被高估时应该 SELL）
 
-### 第 3 步：真实下单跑一场
+### 第 3 步：真实下单
 
-把 `DRY_RUN` 改成 `False`，再跑一场练习案例。看 RIT Client 里的实际持仓、P&L 和 delta，
-跟脚本打印的对得上不对得上。
+把 `DRY_RUN` 改成 `False`，再跑一场。对照 Client 里的实际持仓、P&L、delta，
+看跟脚本打印的对不对得上。
 
 ### 第 4 步：调参
 
-根据第 3 步的结果调 `IV_GAP_THRESHOLD` 和 `DELTA_BAND`，多跑几场。
+根据结果调 `IV_GAP_THRESHOLD` 和 `DELTA_BAND`，多跑几场练习。
 
 ---
 
@@ -123,47 +123,48 @@ python vol_strategy.py
 
 ### 开赛前 30 分钟
 
-- [ ] Windows 机器开机，插电
-- [ ] `git pull` 拿最新代码
-- [ ] 启动 RIT Client，登录
-- [ ] `python test_vol_strategy.py` → 13 个 PASS
-- [ ] 打开 `vol_strategy.py`，确认 **`DRY_RUN = False`**
-- [ ] 确认 `RISK_FREE` 是否需要改（主办方可能改无风险利率）
-- [ ] 确认参数是调好的那组值
+- [ ] Windows 开机、插电、关掉自动更新和休眠
+- [ ] `git pull`
+- [ ] 启动 RIT Client，用**当天的** host / port / 凭证登录
+- [ ] 确认能看到行情在跳
+- [ ] `python test_vol_strategy.py` → 14 个 PASS
+- [ ] `vol_strategy.py` 里确认 `MODE = "client"`、**`DRY_RUN = False`**
+- [ ] 确认 `RISK_FREE`（主办方可能改无风险利率，开场公告会说）
+- [ ] 确认参数是调好的那组
 
 ### 开赛前 5 分钟
 
-- [ ] 在 `code/` 目录下开好命令行，命令敲好但别回车
-- [ ] Client 里确认连的是**正确的案例**
+- [ ] 在 `code` 目录开好命令行，`python vol_strategy.py` 敲好但别回车
+- [ ] Client 里确认连的是正确的案例
 
 ### 开赛
 
-案例状态变成 ACTIVE 后立刻：
-
-```
-python vol_strategy.py
-```
+案例状态变 ACTIVE 后立刻回车。
 
 ### 运行中盯什么
 
-日志每个 tick 一行：
+日志每 tick 一行：
 
 ```
-tick=42 vol=0.200 delta=-3,180 signals=3
+tick=42 vol=0.230 delta=-3,180 signals=3
 ```
 
-- **`delta` 绝对值超过 7000 且不回落** → 立刻 Ctrl+C，在 Client 里手动平仓。罚款是每秒 $0.10 × 超出量，
-  停在 10000 上整场就是 $90,000。
-- **`vol` 一直不变** → 新闻解析挂了，但不影响已有持仓，可以让它跑完
-- **刷屏报 API error** → Ctrl+C，看报错信息
+**只有一件事需要紧盯：`delta` 绝对值超过 7000 且不回落 → 立刻 Ctrl+C，在 Client 里手动平仓。**
+罚款每秒 $0.10 × 超出量，停在 10000 上跑完整场就是 $90,000。
+
+- `vol` 一直不变 → 新闻解析挂了，但不影响已有持仓，可以让它跑完
+- 刷屏 API error → Ctrl+C 看报错
 
 ### 结束
 
-Ctrl+C 优雅退出。未平仓位会按最后成交价自动结算，不需要手动平。
+Ctrl+C 退出。未平仓位按最后成交价自动结算，不用手动平。
 
 ### 多轮之间
 
-规则允许改算法。每轮之间可以改参数重跑 —— 改完存盘，下一轮直接重新 `python vol_strategy.py`。
+规则允许改算法。改完存盘，下一轮直接重新 `python vol_strategy.py`。
+
+> **评分是排名制**：每个 heat 按团队 P&L 排名，取各 heat **排名的平均值**定最终名次，
+> 明确说了是为了防止赌一把。所以**稳定比爆发重要**，别为了某一轮翻盘去放大仓位。
 
 ---
 
@@ -171,11 +172,26 @@ Ctrl+C 优雅退出。未平仓位会按最后成交价自动结算，不需要�
 
 | 症状 | 原因 | 处理 |
 | --- | --- | --- |
-| `ConnectionError` / Connection refused | Client 没开，或没登录 | 启动 Client 并登录 |
-| `401` + Auth failed | API key 不对 | 确认是 `X-API-Key: Rotman` |
-| `KeyError: 'bid'` 之类 | 字段名跟文档不一致 | 照真机返回改 `build_signal_table` |
-| 刷屏 `Rate limit exceeded` | 请求太密 | 把 `LOOP_SLEEP` 从 0.25 调到 0.5 |
+| `ConnectionError` / Connection refused | Client 没开，或没登录进案例 | 登录 Client，确认行情在跳 |
+| `401` | Client 未连上案例；或 API key 不对 | 先确认行情在跳；再查 Client 里的 API key |
+| `KeyError: 'bid'` 之类 | 字段名和文档不一致 | 照真机返回改 `build_signal_table` |
+| 刷屏 `Rate limit exceeded` | 请求太密 | `LOOP_SLEEP` 从 0.25 调到 0.5 |
 | delta 一直超限 | 对冲单被拒或没成交 | Ctrl+C，Client 里手动平 |
-| 完全不下单 | 阈值太高，或 `DRY_RUN` 忘了关 | 检查 `DRY_RUN`，再看 `signals=` |
+| 完全不下单 | 阈值太高，或 `DRY_RUN` 忘了关 | 查 `DRY_RUN`，再看 `signals=` |
 
-**任何情况下最后的兜底是 Ctrl+C + 在 RIT Client 里手动平仓。** Client 一直开着，人工随时能接管。
+**兜底永远是 Ctrl+C + 在 RIT Client 里手动平仓。** Client 一直开着，人工随时能接管。
+
+---
+
+## 附：在 Mac 上测试（备用）
+
+Mac 上没有 Client，只能走 DMA。改 `MODE = "dma"`，并且**凭证从环境变量传**
+（这个仓库是 public，不要写进文件）：
+
+```bash
+export RIT_USER=xxxx-1
+export RIT_PASS=yyyy
+python vol_strategy.py
+```
+
+DMA 用 16595。主要用途是没有 Windows 时验证策略逻辑。

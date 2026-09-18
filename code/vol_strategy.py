@@ -27,7 +27,7 @@ from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_
 # "client" - talks to the RIT Client's own API on this machine. Requires the
 #            Windows desktop Client installed, running and logged in (it is
 #            what serves localhost:9999). Rotman recommends this one.
-MODE = "dma"
+MODE = "client"
 
 PRACTICE_HOST = "flserver.rotman.utoronto.ca"
 DMA_PORT = 16595              # Volatility case, browser/Mac App port
@@ -37,8 +37,16 @@ if MODE == "client":
     API_ENDPOINT = "http://localhost:9999/v1"
     AUTHORIZATION = {"X-API-Key": os.environ.get("RIT_API_KEY", "Rotman")}
 else:
-    USERNAME = os.environ.get("RIT_USER", "tqdu-1")
-    PASSWORD = os.environ.get("RIT_PASS", "invoice")
+    # Never hard-code these: this repo is public. Set them in the shell first.
+    #   macOS/Linux:  export RIT_USER=xxxx-1 RIT_PASS=yyyy
+    #   Windows:      set RIT_USER=xxxx-1    (then set RIT_PASS=yyyy)
+    USERNAME = os.environ.get("RIT_USER")
+    PASSWORD = os.environ.get("RIT_PASS")
+    if not USERNAME or not PASSWORD:
+        raise SystemExit(
+            "DMA mode needs credentials. Set RIT_USER and RIT_PASS in the "
+            "environment, or switch MODE to 'client'."
+        )
     API_ENDPOINT = f"http://{PRACTICE_HOST}:{DMA_PORT}/v1"
     AUTHORIZATION = {
         "Authorization": "Basic "
