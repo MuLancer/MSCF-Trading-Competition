@@ -147,6 +147,23 @@ def test_option_room():
     print("PASS  option_room")
 
 
+def test_option_budget_released_per_week():
+    """Week one must not be able to spend the whole gross limit."""
+    assert [vs.week_of(t) for t in (0, 74, 75, 149, 150, 224, 225, 299)] == \
+           [1, 1, 2, 2, 3, 3, 4, 4]
+
+    empty = []
+    caps = [vs.option_room(empty, t)[0] for t in (1, 80, 160, 240)]
+    assert caps == [625, 1250, 1875, 2500], caps
+
+    # already holding the whole week-one allowance -> no room left that week
+    held = [{"position": 625}]
+    assert vs.option_room(held, tick=1)[0] == 0
+    # ...but the next shift releases more
+    assert vs.option_room(held, tick=80)[0] == 625
+    print("PASS  option_budget_released_per_week")
+
+
 def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):
     calls = []
 

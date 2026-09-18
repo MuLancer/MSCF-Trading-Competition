@@ -75,12 +75,11 @@ DELTA_BAND = 5000            # our own hedge trigger; tune this
 IV_GAP_THRESHOLD = 0.02      # min |market_iv - forecast| to trade; tune this
 MAX_NEW_TRADES_PER_TICK = 2
 
+WEEK_TICKS = 75              # 4 weeks of 75 ticks; vol shifts at each boundary
 UNDERLYING = "RTM"
 LOOP_SLEEP = 0.25            # Client buffers for us, so this can be tighter than DMA
 
-# Log what would be sent instead of sending it. Run the first heat with this
-# on, confirm the signals and hedges look sane, then flip it off.
-DRY_RUN = True
+DRY_RUN = False
 
 shutdown = False
 
@@ -104,10 +103,17 @@ def handle_rate_limit(response):
     return False
 
 
-def handle_auth_failure(response):
+def handle_auth_failure(response, endpoint=""):
     global shutdown
     if response.status_code == 401:
-        print("Auth failed. Is the RIT Client running and the API key correct?")
+        print(f"401 on /{endpoint}: {response.text[:200]}")
+        if endpoint.startswith("orders"):
+            # Orders are refused with 401 while the case is not ACTIVE. That is
+            # a timing problem, not a credentials problem, so do not kill the
+            # run over it -- the heat may simply not have started yet.
+            print("  -> case is probably not ACTIVE yet; not shutting down")
+            return True
+        print("  -> check credentials (MODE, RIT_USER/RIT_PASS, or the API key)")
         shutdown = True
         return True
     return False
@@ -122,7 +128,7 @@ def api_request(session, method, endpoint, params=None):
             resp = session.post(url, params=params)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
-        if handle_auth_failure(resp):
+        if handle_auth_failure(resp, endpoint):
             return None
         if handle_rate_limit(resp):
             continue
@@ -131,9 +137,16 @@ def api_request(session, method, endpoint, params=None):
         raise ApiException(f"API request failed: {resp.text}")
 
 
-def get_tick(session):
+def get_case(session):
+    """-> (tick, status). Status matters: orders are refused until ACTIVE."""
     case = api_request(session, "GET", "case")
-    return None if case is None else case["tick"]
+    if case is None:
+        return None, None
+    return case["tick"], case["status"]
+
+
+def get_tick(session):
+    return get_case(session)[0]
 
 
 def get_securities(session):
@@ -301,11 +314,24 @@ def submit_chunked(session, ticker, action, qty, max_size):
     return True
 
 
-def option_room(rows):
-    """Remaining contract headroom -> (gross_room, net_room)."""
+def week_of(tick):
+    """1..4. Volatility shifts at the start of each week."""
+    return min(4, tick // WEEK_TICKS + 1)
+
+
+def option_room(rows, tick=None):
+    """Remaining contract headroom -> (gross_room, net_room).
+
+    The gross budget is released a quarter per week instead of all at once.
+    The largest edges appear right after each volatility shift, and the market
+    maker then learns the new level within the week, so signals are strongest
+    early in a week and fade. Spending the whole limit on week one leaves
+    nothing for the three later shifts, which are the same opportunity again.
+    """
     gross = sum(abs(r["position"]) for r in rows)
     net = sum(r["position"] for r in rows)
-    return OPT_GROSS_LIMIT - gross, OPT_NET_LIMIT - abs(net)
+    cap = OPT_GROSS_LIMIT if tick is None else OPT_GROSS_LIMIT * week_of(tick) // 4
+    return cap - gross, OPT_NET_LIMIT - abs(net)
 
 
 def portfolio_delta(securities, rows):
@@ -329,9 +355,29 @@ def main():
         session.headers.update(AUTHORIZATION)
         vol_state = new_vol_state()
 
-        tick = get_tick(session)
+        tick, status = get_case(session)
+        last_tick = None
         while tick is not None and tick < TOTAL_TICKS and not shutdown:
             try:
+                # Between heats the case still answers GETs but refuses orders,
+                # so wait rather than firing signals into a stopped market.
+                if status != "ACTIVE":
+                    print(f"waiting for case to start (tick={tick} status={status})")
+                    sleep(1)
+                    tick, status = get_case(session)
+                    continue
+
+                # A tick lasts about a second but this loop polls four times a
+                # second. Acting on every pass sent the same orders three or
+                # four times over and re-hedged a delta that the earlier fills
+                # had not yet been reflected in /securities, so the hedge
+                # overshot into the opposite sign. Act once per tick only.
+                if tick == last_tick:
+                    sleep(LOOP_SLEEP)
+                    tick, status = get_case(session)
+                    continue
+                last_tick = tick
+
                 update_vol_state(session, vol_state)
 
                 securities = get_securities(session)
@@ -342,7 +388,7 @@ def main():
                                           tick, vol_state["risk_free"])
                 orders = select_trades(rows)
 
-                gross_room, net_room = option_room(rows)
+                gross_room, net_room = option_room(rows, tick)
                 pending_delta = 0.0
                 for o in orders[:MAX_NEW_TRADES_PER_TICK]:
                     qty = min(OPT_MAX_ORDER, gross_room, net_room)
@@ -356,12 +402,14 @@ def main():
                 net_delta = portfolio_delta(securities, rows) + pending_delta
                 hedge_delta(session, net_delta)
 
-                print(f"tick={tick} vol={vol_state['current_vol']:.3f} "
+                print(f"tick={tick} wk={week_of(tick)} "
+                      f"vol={vol_state['current_vol']:.3f} "
                       f"r={vol_state['risk_free']:.3f} "
-                      f"delta={net_delta:,.0f} signals={len(orders)}")
+                      f"delta={net_delta:,.0f} signals={len(orders)} "
+                      f"room={max(gross_room, 0)}")
 
                 sleep(LOOP_SLEEP)
-                tick = get_tick(session)
+                tick, status = get_case(session)
             except ApiException as e:
                 print(f"API error: {e}")
                 sleep(1)
