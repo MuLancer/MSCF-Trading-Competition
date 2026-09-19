@@ -70,6 +70,19 @@ ARB_LEG_COST = 3 * FEE_EQUITY
 ARB_MARGIN = 1.5
 ARB_QTY = 5000
 
+# ARB_QTY sizes ONE entry. Nothing used to size the book, so entries stacked:
+# across 85 recorded heats positions reached 95,000 RITC, nineteen entries
+# deep, because the server's gross cap (300,000 at a 2.5 weight per unit, so
+# 120,000 units) never binds. Mean net P&L by the peak position a heat ran:
+#
+#     <= 10,000    -5,267        30,001-50,000    -78,728
+#   10-20,000     -12,314        over 50,000     -123,170
+#   20-30,000     -21,913
+#
+# Roughly linear to 30,000, then it breaks. 20,000 keeps the book in the part
+# of that table where the loss is entry cost rather than a blow-up.
+MAX_SPREAD_SHARES = 20000
+
 # A tender is only worth taking if unwinding it clears the round trip. The
 # unwind is the expensive half: it crosses the spread on three legs.
 TENDER_MARGIN = 1.5
@@ -359,6 +372,30 @@ def arb_room(b, weights, caps, direction=None):
     return max(0, min(room, net_room))
 
 
+def position_room(b, direction):
+    """Shares of new spread allowed, given what is already on.
+
+    Two separate limits, both read off the recorded heats.
+
+    The ceiling is MAX_SPREAD_SHARES: without it `direction` is derived from
+    the current edge alone and never looks at the book, so a signal that
+    repeats adds another ARB_QTY every time it fires.
+
+    The sign is the expensive one. A signal opposite to the open spread is
+    allowed to reduce it, to flat and no further. Crossing through zero cost
+    17,707 CAD on average across 120 recorded flips: it pays the round trip
+    on the whole accumulated stack to put on a position the next flip pays
+    to take off again. Holding earned +1,014,835 across the sample while the
+    ticks that changed position lost 5,445,383, so the trade to avoid is the
+    one that reverses.
+    """
+    pos = b[RITC]["position"]
+    want = -1 if direction == "sell_etf" else 1     # sign this entry adds
+    if pos * want >= 0:                             # adding to the side held
+        return max(0, MAX_SPREAD_SHARES - abs(pos))
+    return abs(pos)                                 # reducing: only to flat
+
+
 def get_limits(session):
     """{gross, net} for the stock limit, as configured on this server."""
     for lim in api_request(session, "GET", "limits") or []:
@@ -543,13 +580,37 @@ def hedge_currency(session, b):
     on the exchange rate, which is not the trade and is not what the edge was
     measured in.
     """
-    exposure = b[RITC]["position"] * b[RITC]["bid"]        # in USD
-    held = b[USD]["position"]
-    needed = -exposure - held
+    needed = currency_gap(b)
     if abs(needed) < 1000:
         return False
     action = "BUY" if needed > 0 else "SELL"
     return place_chunked(session, USD, action, abs(needed), MAX_ORDER_FX)
+
+
+def currency_gap(b):
+    """USD that must be bought (+) or sold (-) to neutralise the ETF leg."""
+    exposure = b[RITC]["position"] * b[RITC]["bid"]        # in USD
+    return -exposure - b[USD]["position"]
+
+
+def square_up(session, b):
+    """Put the book back to a clean, currency-hedged spread.
+
+    Run every tick that has nothing resting. Before this, the imbalance check
+    only fired when a working order retired, and in market mode it never
+    fired at all: the recorded heats sat at |imbalance| over 500 shares on
+    12% of ticks, peaking at 100,000, and carried |USD| over 100,000 on 44%
+    of ticks against a 2.2M peak. Neither is the arbitrage; both are naked
+    directional risk in a case whose whole edge is that it has none.
+    """
+    if abs(spread_imbalance(b)) < 500 and abs(currency_gap(b)) < 1000:
+        return
+    current = refresh_book(session)        # legs may have filled this tick
+    if current is None:
+        return
+    if flatten_imbalance(session, current):
+        current = refresh_book(session) or current     # RITC just moved
+    hedge_currency(session, current)
 
 
 # -------------------------------------------------------------------- tenders
@@ -621,8 +682,7 @@ def manage_working_orders(session, b, working, tick):
     still_resting = [i for i in working["ids"] if i in live]
 
     if not still_resting:
-        flatten_imbalance(session, b)
-        return None
+        return None          # square_up squares whatever filled
 
     if tick - working["since"] < MAX_WORKING_TICKS:
         return {"ids": still_resting, "since": working["since"]}
@@ -630,11 +690,7 @@ def manage_working_orders(session, b, working, tick):
     # stale: the prices these were justified by have moved on
     for order_id in still_resting:
         cancel(session, order_id)
-    current = refresh_book(session)
-    if current is not None:
-        flatten_imbalance(session, current)
-        hedge_currency(session, current)
-    return None
+    return None              # square_up squares whatever filled
 
 
 # ------------------------------------------------------------------ main loop
@@ -691,6 +747,13 @@ def main():
                 if EXECUTION == "limit":
                     working = manage_working_orders(session, b, working, tick)
 
+                # Nothing resting means the book should already be a clean
+                # spread. While orders are working an uneven book is expected
+                # -- the legs are mid-fill -- so squaring then would fight
+                # our own quotes.
+                if not working:
+                    square_up(session, b)
+
                 touch_rich, touch_cheap = (passive_edges(b, rebate)
                                            if EXECUTION == "limit"
                                            else arb_edges(b))
@@ -717,18 +780,19 @@ def main():
                 if EXECUTION == "limit" and working:
                     qty = 0          # one spread working at a time
 
-                if etf_rich > floor and qty:
+                # The side is decided here, so the book check belongs here
+                # too: the depth walk above can knock out the side `direction`
+                # chose and leave the other one standing.
+                side = ("sell_etf" if etf_rich > floor else
+                        "buy_etf" if etf_cheap > floor else None)
+                if side:
+                    qty = min(qty, position_room(b, side))
+                if side and qty:
                     if EXECUTION == "limit":
-                        working = {"ids": post_spread(session, b, "sell_etf", qty),
+                        working = {"ids": post_spread(session, b, side, qty),
                                    "since": tick}
                     else:
-                        trade_arb(session, b, "sell_etf", qty)
-                elif etf_cheap > floor and qty:
-                    if EXECUTION == "limit":
-                        working = {"ids": post_spread(session, b, "buy_etf", qty),
-                                   "since": tick}
-                    else:
-                        trade_arb(session, b, "buy_etf", qty)
+                        trade_arb(session, b, side, qty)
                 # nothing else: an open spread is held to settlement
 
                 sleep(LOOP_SLEEP)

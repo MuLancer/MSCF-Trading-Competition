@@ -31,16 +31,13 @@ from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_
 MODE = "dma"
 
 PRACTICE_HOST = "flserver.rotman.utoronto.ca"
-DMA_PORT = 16595              # Volatility case, browser/Mac App port
+DMA_PORT = 16655       # Volatility case, browser/Mac App port
 CLIENT_PORT = 16590           # Volatility case, port the Windows Client logs into
 
 if MODE == "client":
     API_ENDPOINT = "http://localhost:9999/v1"
     AUTHORIZATION = {"X-API-Key": os.environ.get("RIT_API_KEY", "Rotman")}
 else:
-    # Never hard-code these: this repo is public. Set them in the shell first.
-    #   macOS/Linux:  export RIT_USER=xxxx-1 RIT_PASS=yyyy
-    #   Windows:      set RIT_USER=xxxx-1    (then set RIT_PASS=yyyy)
     USERNAME = "tqdu-1"
     PASSWORD = "invoice"
     if not USERNAME or not PASSWORD:
@@ -144,15 +141,38 @@ def handle_auth_failure(response, endpoint=""):
     return False
 
 
+
+def explain_connection_failure():
+    """Say what to do instead of unwinding twenty frames of urllib3.
+
+    Connection refused on localhost:9999 means the Client is not serving,
+    which under time pressure is worth one sentence rather than a traceback.
+    """
+    print("\n" + "!" * 68)
+    print(f"  CANNOT REACH {API_ENDPOINT}")
+    if "localhost" in API_ENDPOINT:
+        print("  Nothing is listening on the RIT Client's port. Either:")
+        print("    - the Windows RIT Client is not running or not logged in")
+        print("    - or this is a Mac, where the Client does not exist at all")
+        print('  On a Mac set MODE = "dma" and export RIT_USER / RIT_PASS.')
+    else:
+        print("  The server did not answer. Check the host and port, and that")
+        print("  the practice server for this case is still up.")
+    print("!" * 68)
+
 def api_request(session, method, endpoint, params=None):
     while True:
         url = f"{API_ENDPOINT}/{endpoint}"
-        if method == "GET":
-            resp = session.get(url, params=params)
-        elif method == "POST":
-            resp = session.post(url, params=params)
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
+        try:
+            if method == "GET":
+                resp = session.get(url, params=params)
+            elif method == "POST":
+                resp = session.post(url, params=params)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+        except requests.exceptions.ConnectionError:
+            explain_connection_failure()
+            raise SystemExit(1)
         if handle_auth_failure(resp, endpoint):
             return None
         if handle_rate_limit(resp):

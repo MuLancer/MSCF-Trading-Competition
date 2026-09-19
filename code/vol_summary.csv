@@ -1,0 +1,2 @@
+heat,ticks,pnl,fines,pnl_net,peak_delta,ticks_over_limit,fine_from_delta,max_drawdown,ticks_blocked,ticks_idle
+10,193,58273.18,4632.9,53640.28,11180.0,6,1219.6000000000001,12850.119999999999,0,48

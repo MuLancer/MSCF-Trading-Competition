@@ -12,15 +12,15 @@ Mac app **不会**开这个端口,登录它们对 REST 脚本没有任何帮助�
 
 **练习服务器**(竞赛日当天关闭):
 
-| 案例 | Windows Client | DMA(浏览器/Mac) | Trader ID |
-| --- | --- | --- | --- |
-| Volatility Trading | **16590** | 16595 | `tqdu-1` |
-| Algorithmic ETF Arb | **16630** | 16635 | `tqdu` |
+| 案例 | Windows Client | DMA(浏览器/Mac) |
+| --- | --- | --- |
+| Volatility Trading | **16590** | 16595 |
+| Algorithmic ETF Arb | **16630** | 16635 |
 
 Host 都是 `flserver.rotman.utoronto.ca`。
 
-> **两个案例的 Trader ID 不一样**,`tqdu-1` 登不进 ETF 案例。
-> **同一案例两个端口也别搞混**:Client 用 16590/16630,另一个是给 DMA 的。
+> **两个案例各自有一组凭证,不通用。** 同一案例的两个端口也别搞混:
+> Client 用 16590/16630,另一个是给 DMA 的。
 
 > **竞赛日**:练习服务器关闭,竞赛端口只在当天开放,主办方另发一组凭证。
 > 当天第一件事是换 host / port / 凭证,不要沿用练习的。
@@ -107,6 +107,24 @@ python etf_strategy.py --check      # 只读，不下单
 ---
 
 ## 三、比赛当天
+
+### ETF 监控与复盘
+
+另开一个窗口运行只读监控；它不会下单，并把 ETF 每 tick 写入
+`code/etf_ticks.csv`:
+
+```
+cd code
+python3 -u etf_monitor.py
+```
+
+结束后查看各 heat 的 P&L、回撤和机会次数:
+
+```
+python3 etf_monitor.py --review
+```
+
+波动率案例仍使用 `monitor.py` 和 `ticks.csv`，两套记录互不覆盖。
 
 ### 开赛前 30 分钟
 

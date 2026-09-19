@@ -245,6 +245,76 @@ def test_uneven_fills_are_squared_not_left_alone():
     print("PASS  uneven_fills_are_squared_not_left_alone")
 
 
+def test_entries_do_not_stack_without_limit():
+    """ARB_QTY sizes one entry; something has to size the book."""
+    flat = {"RITC": {"position": 0}}
+    assert es.position_room(flat, "sell_etf") == es.MAX_SPREAD_SHARES
+    assert es.position_room(flat, "buy_etf") == es.MAX_SPREAD_SHARES
+
+    # short 18,000 ETF: room for 2,000 more of the same, not another 5,000
+    deep = {"RITC": {"position": -18000}}
+    assert es.position_room(deep, "sell_etf") == 2000
+    assert min(es.ARB_QTY, es.position_room(deep, "sell_etf")) == 2000
+
+    full = {"RITC": {"position": -es.MAX_SPREAD_SHARES}}
+    assert es.position_room(full, "sell_etf") == 0
+    over = {"RITC": {"position": -95000}}      # the worst heat on record
+    assert es.position_room(over, "sell_etf") == 0
+    print(f"PASS  entries_do_not_stack_without_limit "
+          f"(cap {es.MAX_SPREAD_SHARES:,}; 95,000 was reached without one)")
+
+
+def test_an_opposite_signal_reduces_but_never_flips():
+    """Crossing through zero cost 17,707 CAD a time across 120 recorded flips."""
+    long_etf = {"RITC": {"position": 30000}}
+    # the opposite signal may take the position off, down to flat
+    assert es.position_room(long_etf, "sell_etf") == 30000
+    # but each entry is still ARB_QTY, so it walks down, never reverses
+    assert min(es.ARB_QTY, es.position_room(long_etf, "sell_etf")) == es.ARB_QTY
+    # and once flat, the cap -- not the old position -- is what is left
+    assert es.position_room({"RITC": {"position": 0}}, "sell_etf") == es.MAX_SPREAD_SHARES
+
+    short_etf = {"RITC": {"position": -30000}}
+    assert es.position_room(short_etf, "buy_etf") == 30000
+    assert es.position_room(short_etf, "sell_etf") == 0, "already past the cap"
+    print("PASS  an_opposite_signal_reduces_but_never_flips")
+
+
+def test_the_book_is_squared_every_quiet_tick():
+    """The old check only ran when a working order retired; market mode never."""
+    calls = []
+    clean = {"RITC": {"position": -5000, "bid": 24.22},
+             "BULL": {"position": 5000}, "BEAR": {"position": 5000},
+             "USD": {"position": 5000 * 24.22}}
+    # a clean, hedged book costs nothing: no refresh, no orders
+    orig_refresh, orig_flat, orig_hedge = (es.refresh_book,
+                                           es.flatten_imbalance, es.hedge_currency)
+    es.refresh_book = lambda s: calls.append("refresh") or clean
+    es.flatten_imbalance = lambda s, b: calls.append("flatten") or False
+    es.hedge_currency = lambda s, b: calls.append("hedge") or False
+    try:
+        es.square_up(None, clean)
+        assert calls == [], calls
+
+        # a leg missing: the book is refreshed, squared and re-hedged
+        lopsided = dict(clean, BULL={"position": 0}, BEAR={"position": 0})
+        es.square_up(None, lopsided)
+        assert "flatten" in calls and "hedge" in calls, calls
+
+        # unhedged currency alone is enough to act on
+        calls.clear()
+        es.square_up(None, dict(clean, USD={"position": 0}))
+        assert "hedge" in calls, calls
+    finally:
+        (es.refresh_book, es.flatten_imbalance,
+         es.hedge_currency) = orig_refresh, orig_flat, orig_hedge
+
+    # and the currency test itself is the one hedge_currency acts on
+    assert abs(es.currency_gap(clean)) < 1000
+    assert es.currency_gap(dict(clean, USD={"position": 0})) > 1000
+    print("PASS  the_book_is_squared_every_quiet_tick")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
