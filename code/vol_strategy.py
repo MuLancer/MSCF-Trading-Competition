@@ -81,16 +81,21 @@ DELTA_BAND = 2500            # hedge trigger; below this, drift is left alone
 # The option book's own delta must stay inside what the underlying leg can
 # offset, with room to spare for gamma near expiry. Past this the hedge runs
 # out of position limit and the delta cannot be brought back at all.
-MAX_OPTION_DELTA = 0.7 * RTM_GROSS_LIMIT
+MAX_OPTION_DELTA = 0.4 * RTM_GROSS_LIMIT
 # Over the final stretch the allowance above is wound down to zero, because
 # gamma makes the book unhedgeable exactly when the hedge has least room.
-WINDDOWN_TICKS = 60
+WINDDOWN_TICKS = 90
 IV_GAP_THRESHOLD = 0.02      # min |market_iv - forecast| to trade; tune this
-MAX_NEW_TRADES_PER_TICK = 2
+MAX_NEW_TRADES_PER_TICK = 4
 # Required gross edge per contract, counted in round-trip commissions. Vega
 # decays with sqrt(time left) while the commission does not, so this is what
 # stops the last stretch of the heat from trading at a loss.
 MIN_EDGE_MULTIPLE = 1.5
+# A mispricing only pays once the market maker walks toward the forecast, and
+# that takes it roughly fifty ticks. A position opened with less time than
+# that left may never be repriced before expiry, so it rides on realised
+# volatility alone. 0 disables the screen.
+MIN_TICKS_TO_WORK = 0
 
 WEEK_TICKS = 75              # 4 weeks of 75 ticks; vol shifts at each boundary
 # How many weeks the gross budget takes to be fully released. 4 spreads it a
@@ -329,7 +334,7 @@ def expected_edge(row):
     return abs(row["iv_gap"]) * row["vega"] * 10000
 
 
-def select_trades(rows, threshold=IV_GAP_THRESHOLD):
+def select_trades(rows, threshold=IV_GAP_THRESHOLD, tick=None):
     """iv_gap > 0 means the option is rich -> SELL. Sorted by dollar edge.
 
     A volatility gap is not worth the same everywhere. Vega falls with the
@@ -339,6 +344,8 @@ def select_trades(rows, threshold=IV_GAP_THRESHOLD):
     vol points tightens the bar automatically as expiry approaches, and ranks
     by what each trade actually earns rather than by how mispriced it looks.
     """
+    if tick is not None and TOTAL_TICKS - tick < MIN_TICKS_TO_WORK:
+        return []
     floor = MIN_EDGE_MULTIPLE * 2 * FEE_OPT
     picks = [r for r in rows
              if r["iv_gap"] is not None
@@ -665,7 +672,7 @@ def main():
                 forecast = blended_vol(vol_state, tick)
                 rows = build_signal_table(securities, forecast,
                                           tick, vol_state["risk_free"])
-                orders = select_trades(rows)
+                orders = select_trades(rows, tick=tick)
 
                 # Limits count every leg, not just the ones that priced.
                 legs = option_legs(securities)

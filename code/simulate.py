@@ -253,14 +253,12 @@ def main():
     # same paths for every setting, so the comparison is paired
     variants = [
         ("baseline", {}),
-        ("threshold 0.01", {"IV_GAP_THRESHOLD": 0.01}),
-        ("threshold 0.03", {"IV_GAP_THRESHOLD": 0.03}),
-        ("hedge band 1500", {"DELTA_BAND": 1500}),
         ("hedge band 4000", {"DELTA_BAND": 4000}),
-        ("1 trade/tick", {"MAX_NEW_TRADES_PER_TICK": 1}),
-        ("4 trades/tick", {"MAX_NEW_TRADES_PER_TICK": 4}),
-        ("budget over 2wk", {"BUDGET_WEEKS": 2}),
-        ("no rationing", {"BUDGET_WEEKS": 1}),
+        ("2 trades/tick (old)", {"MAX_NEW_TRADES_PER_TICK": 2}),
+        ("winddown 30", {"WINDDOWN_TICKS": 30}),
+        ("winddown 45", {"WINDDOWN_TICKS": 45}),
+        ("winddown 90", {"WINDDOWN_TICKS": 90}),
+        ("book delta 0.5x", {"MAX_OPTION_DELTA": 0.5 * 50000}),
     ]
     rows = []
     for label, overrides in variants:

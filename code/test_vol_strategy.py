@@ -198,23 +198,23 @@ def test_unquotable_legs_still_carry_their_delta():
 def test_option_book_capped_to_hedge_capacity():
     """2,500 contracts can out-delta a 50,000 share hedge."""
     call = {"ticker": "RTM50C", "action": "BUY", "delta": 0.5}
-    assert vs.MAX_OPTION_DELTA == 35000
+    assert vs.MAX_OPTION_DELTA == 20000
 
     early = 1   # full allowance this early in the heat
     # the budget is returned raw; the caller mins it with the order cap
     assert vs.hedgeable_qty(call, 0, early) > vs.OPT_MAX_ORDER
     # already near the cap -> only a sliver fits, below a full order
-    assert vs.hedgeable_qty(call, 32000, early) == 60
+    assert vs.hedgeable_qty(call, 17000, early) == 60
     # at the cap -> nothing more in that direction
-    assert vs.hedgeable_qty(call, 35000, early) == 0
+    assert vs.hedgeable_qty(call, 20000, early) == 0
     # ...but trades that shrink the exposure are unrestricted
-    assert vs.hedgeable_qty(call, -35000, early) > vs.OPT_MAX_ORDER
+    assert vs.hedgeable_qty(call, -20000, early) > vs.OPT_MAX_ORDER
 
     # the allowance winds down to nothing over the final stretch
-    assert vs.option_delta_budget(240) == vs.MAX_OPTION_DELTA
-    assert vs.option_delta_budget(270) == vs.MAX_OPTION_DELTA / 2
+    assert vs.option_delta_budget(200) == vs.MAX_OPTION_DELTA
+    assert vs.option_delta_budget(255) == vs.MAX_OPTION_DELTA / 2
     assert vs.option_delta_budget(300) == 0
-    assert vs.hedgeable_qty(call, 20000, 285) == 0, "no room left near expiry"
+    assert vs.hedgeable_qty(call, 12000, 285) == 0, "no room left near expiry"
     print("PASS  option_book_capped_to_hedge_capacity")
 
 
