@@ -180,6 +180,71 @@ def test_positions_are_held_to_settlement():
           f"tick 150 earns {earns_from(150):.2f}/sh, tick 250 only {earns_from(250):.2f})")
 
 
+def test_passive_prices_never_cross():
+    """A crossing order is marketable: it pays the fee and gives back the spread."""
+    for ticker in ("RITC", "BULL", "BEAR"):
+        bid, ask = BOOK[ticker]["bid"], BOOK[ticker]["ask"]
+        buy = es.passive_price(BOOK, ticker, "BUY")
+        sell = es.passive_price(BOOK, ticker, "SELL")
+        assert bid <= buy < ask, f"{ticker} buy {buy} not inside {bid}/{ask}"
+        assert bid < sell <= ask, f"{ticker} sell {sell} not inside {bid}/{ask}"
+        assert buy < sell, "the two sides must not cross each other"
+
+    # a one-tick-wide market leaves no room to improve; stay at the touch
+    tight = {"X": {"bid": 10.00, "ask": 10.01}}
+    assert 10.00 <= es.passive_price(tight, "X", "BUY") <= 10.01
+    print("PASS  passive_prices_never_cross")
+
+
+def test_posting_beats_crossing_by_the_spread_and_the_rebate():
+    rebate = 0.03                      # the server pays this, not the 0.01 quoted
+    market_rich, market_cheap = es.arb_edges(BOOK)
+    passive_rich, passive_cheap = es.passive_edges(BOOK, rebate)
+
+    # three legs swing by fee + rebate each, plus the spread no longer crossed
+    assert passive_rich > market_rich
+    assert passive_cheap > market_cheap
+    gain = passive_cheap - market_cheap
+    # the rebate part is kept whole; the spread part is discounted
+    assert gain >= 3 * rebate, gain
+    full = (es.passive_price(BOOK, "BULL", "SELL")
+            + es.passive_price(BOOK, "BEAR", "SELL")
+            - es.passive_price(BOOK, "RITC", "BUY") * BOOK["USD"]["ask"]
+            + 3 * rebate)
+    assert passive_cheap < full, "spread capture must not be assumed certain"
+    print(f"PASS  posting_beats_crossing_by_the_spread_and_the_rebate "
+          f"(cheap {market_cheap:+.3f} -> {passive_cheap:+.3f}, +{gain:.3f}/sh)")
+
+
+def test_uneven_fills_are_squared_not_left_alone():
+    """A half-filled spread is a directional position, which this case is not."""
+    clean = {"RITC": {"position": -5000}, "BULL": {"position": 5000},
+             "BEAR": {"position": 5000}}
+    assert abs(es.spread_imbalance(clean)) < 1e-9
+
+    # the ETF leg filled but the basket did not
+    lopsided = {"RITC": {"position": -5000}, "BULL": {"position": 0},
+                "BEAR": {"position": 0}}
+    assert es.spread_imbalance(lopsided) == -5000
+
+    sent = []
+    original, orig_dry = es.api_request, es.DRY_RUN
+    es.api_request = lambda s, m, e, params=None: sent.append(params) or {}
+    es.DRY_RUN = False
+    try:
+        es.flatten_imbalance(None, lopsided)
+        assert sent and sent[0]["ticker"] == "RITC"
+        assert sent[0]["action"] == "BUY", "short 5,000 ETF must be bought back"
+        assert sum(o["quantity"] for o in sent) == 5000
+
+        sent.clear()
+        assert es.flatten_imbalance(None, clean) is False
+        assert sent == [], "a balanced spread must not be touched"
+    finally:
+        es.api_request, es.DRY_RUN = original, orig_dry
+    print("PASS  uneven_fills_are_squared_not_left_alone")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

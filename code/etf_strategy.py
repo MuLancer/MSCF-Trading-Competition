@@ -33,6 +33,21 @@ TOTAL_TICKS = 300
 FEE_EQUITY = 0.02            # per share, market orders
 REBATE_LIMIT = 0.01          # per share, filled limit orders
 MAX_ORDER_EQUITY = 10000
+# "limit" posts passively and waits; "market" crosses the spread immediately.
+# Market orders realised 0.30 CAD a share worse than the quote they were
+# measured against, which is more than the whole edge. Posting instead earns
+# the rebate rather than paying the fee and never crosses a stale spread.
+EXECUTION = "limit"
+TICK_SIZE = 0.01
+# A resting order that has not filled in this many ticks is stale: the price
+# it was justified by has moved on.
+MAX_WORKING_TICKS = 5
+# How much of the spread a resting order is assumed to actually capture.
+# Posting inside the touch only fills when the market comes to us, and the
+# side that comes to us is the side moving against us. Half is a guess, not a
+# measurement -- run a heat in DRY_RUN and compare posted prices to fills
+# before trusting it further.
+PASSIVE_CAPTURE = 0.5
 MAX_ORDER_FX = 2500000
 
 # The limits and the weight each ticker carries are READ FROM THE SERVER, not
@@ -379,6 +394,117 @@ def place_chunked(session, ticker, action, qty, cap):
     return True
 
 
+def get_open_orders(session):
+    return api_request(session, "GET", "orders", params={"status": "OPEN"}) or []
+
+
+def cancel(session, order_id):
+    try:
+        api_request(session, "DELETE", f"orders/{order_id}")
+    except ApiException:
+        pass          # already filled or already gone; nothing to undo
+
+
+def passive_price(b, ticker, action):
+    """Where to rest so the order earns the rebate instead of paying the fee.
+
+    One tick inside the touch takes queue priority without crossing. Crossing
+    would make the order marketable, which pays the fee and gives back the
+    spread -- the exact cost this execution mode exists to avoid.
+    """
+    bid, ask = b[ticker]["bid"], b[ticker]["ask"]
+    if action == "BUY":
+        return round(min(bid + TICK_SIZE, ask - TICK_SIZE), 2)
+    return round(max(ask - TICK_SIZE, bid + TICK_SIZE), 2)
+
+
+def passive_edges(b, rebate):
+    """(etf_rich, etf_cheap) assuming every leg fills where we rest it.
+
+    NOT an arbitrage figure. Both sides can read positive at once -- on a live
+    book they read +0.27 and +0.39 together -- because each assumes we collect
+    the spread rather than pay it, and the same spread cannot be collected
+    twice. What it really measures is the profit IF all three legs fill where
+    they rest, which is a market-making outcome, not an arbitrage one.
+
+    Only part of it is dependable. The rebate replacing the fee is worth
+    3 x (fee + rebate) = 0.15 a share and is certain once filled. The rest is
+    spread we capture only when someone crosses to us, and whoever crosses is
+    usually right about the direction. Treat the surplus over 0.15 as a
+    probability, which is why PASSIVE_CAPTURE discounts it.
+    """
+    certain = 3 * rebate
+    rich = (passive_price(b, RITC, "SELL") * b[USD]["bid"]
+            - passive_price(b, BULL, "BUY") - passive_price(b, BEAR, "BUY"))
+    cheap = (passive_price(b, BULL, "SELL") + passive_price(b, BEAR, "SELL")
+             - passive_price(b, RITC, "BUY") * b[USD]["ask"])
+    # discount the spread-dependent part, keep the rebate whole
+    market_rich, market_cheap = arb_edges(b)
+    rich = market_rich + certain + PASSIVE_CAPTURE * (rich - certain - market_rich)
+    cheap = market_cheap + certain + PASSIVE_CAPTURE * (cheap - certain - market_cheap)
+    return rich, cheap
+
+
+def rebate_per_share(securities):
+    """The rebate the server actually pays, which is not the handout's 0.01."""
+    for s in securities:
+        if s["ticker"] == BULL:
+            return float(s.get("limit_order_rebate") or 0.0)
+    return 0.0
+
+
+def place_limit(session, ticker, action, qty, price):
+    if qty <= 0:
+        return None
+    if DRY_RUN:
+        print(f"    [DRY] {action:4} {int(qty):>7} {ticker} LIMIT {price}")
+        return None
+    try:
+        resp = api_request(session, "POST", "orders",
+                           params={"ticker": ticker, "type": "LIMIT",
+                                   "quantity": int(qty), "action": action,
+                                   "price": price})
+    except ApiException as e:
+        human_alert(f"Limit rejected: {action} {int(qty)} {ticker} @ {price}: {e}")
+        return None
+    return resp["order_id"] if resp else None
+
+
+def post_spread(session, b, direction, qty):
+    """Rest all three legs at once and return the order ids that took."""
+    legs = ((RITC, "SELL"), (BULL, "BUY"), (BEAR, "BUY")) if direction == "sell_etf" \
+        else ((RITC, "BUY"), (BULL, "SELL"), (BEAR, "SELL"))
+    ids = []
+    for ticker, action in legs:
+        for lot in range(0, int(qty), MAX_ORDER_EQUITY):
+            size = min(MAX_ORDER_EQUITY, int(qty) - lot)
+            oid = place_limit(session, ticker, action, size,
+                              passive_price(b, ticker, action))
+            if oid:
+                ids.append(oid)
+    return ids
+
+
+def spread_imbalance(b):
+    """How far the book is from a clean one-for-one spread, in RITC shares.
+
+    Legs fill independently, so a cancelled or unfilled leg leaves the book
+    directional. That is the one risk this execution mode adds, and it is not
+    allowed to persist.
+    """
+    return b[RITC]["position"] + (b[BULL]["position"] + b[BEAR]["position"]) / 2
+
+
+def flatten_imbalance(session, b):
+    """Force the odd leg back at market. Only the imbalance, never the spread."""
+    off = spread_imbalance(b)
+    if abs(off) < 500:
+        return False
+    action = "SELL" if off > 0 else "BUY"
+    human_alert(f"Legs filled unevenly by {off:+,.0f}; correcting at market.")
+    return place_chunked(session, RITC, action, abs(off), MAX_ORDER_EQUITY)
+
+
 def refresh_book(session):
     securities = get_securities(session)
     return None if securities is None else book(securities)
@@ -481,6 +607,36 @@ def handle_tenders(session, b, weights, caps, attempted_tenders):
                         f"{lots * CONVERT_LOT:,} shares require conversion.")
 
 
+def manage_working_orders(session, b, working, tick):
+    """Watch resting orders; retire them once stale and square what filled.
+
+    Returns the working state, or None when nothing is outstanding. Legs fill
+    independently, so the job here is to make sure a half-filled spread never
+    becomes a directional position that is simply left alone.
+    """
+    if not working:
+        return None
+
+    live = {o["order_id"] for o in get_open_orders(session)}
+    still_resting = [i for i in working["ids"] if i in live]
+
+    if not still_resting:
+        flatten_imbalance(session, b)
+        return None
+
+    if tick - working["since"] < MAX_WORKING_TICKS:
+        return {"ids": still_resting, "since": working["since"]}
+
+    # stale: the prices these were justified by have moved on
+    for order_id in still_resting:
+        cancel(session, order_id)
+    current = refresh_book(session)
+    if current is not None:
+        flatten_imbalance(session, current)
+        hedge_currency(session, current)
+    return None
+
+
 # ------------------------------------------------------------------ main loop
 def unwind(session, b):
     """Close the arb back to flat once the spread has done its work."""
@@ -501,6 +657,7 @@ def main():
         caps = get_limits(session)
         last_tick = None
         attempted_tenders = set()
+        working = None
         reported_status = None
 
         while tick is not None and tick < TOTAL_TICKS and not shutdown:
@@ -519,6 +676,7 @@ def main():
                     continue
                 if last_tick is not None and tick < last_tick:
                     attempted_tenders.clear()
+                    working = None
                 last_tick = tick
 
                 securities = get_securities(session)
@@ -526,18 +684,27 @@ def main():
                     break
                 b = book(securities)
                 weights = limit_weights(securities)
+                rebate = rebate_per_share(securities)
 
                 handle_tenders(session, b, weights, caps, attempted_tenders)
 
-                touch_rich, touch_cheap = arb_edges(b)
+                if EXECUTION == "limit":
+                    working = manage_working_orders(session, b, working, tick)
+
+                touch_rich, touch_cheap = (passive_edges(b, rebate)
+                                           if EXECUTION == "limit"
+                                           else arb_edges(b))
                 floor = ARB_MARGIN * ARB_LEG_COST
                 direction = ("sell_etf" if touch_rich > floor else
                              "buy_etf" if touch_cheap > floor else None)
                 room = arb_room(b, weights, caps, direction)
                 qty = min(ARB_QTY, room)
-                if direction and qty:
+                if direction and qty and EXECUTION == "market":
                     etf_rich, etf_cheap = arb_edges_depth(session, b, qty)
                 else:
+                    # A resting order is not swept through the ladder: it
+                    # fills at the price posted or not at all, so the depth
+                    # walk that market orders need does not apply.
                     etf_rich, etf_cheap = touch_rich, touch_cheap
 
                 # A new position must have time left to earn back what it
@@ -547,10 +714,21 @@ def main():
                 if runway < MIN_TICKS_TO_EARN_ENTRY:
                     qty = 0
 
+                if EXECUTION == "limit" and working:
+                    qty = 0          # one spread working at a time
+
                 if etf_rich > floor and qty:
-                    trade_arb(session, b, "sell_etf", qty)
+                    if EXECUTION == "limit":
+                        working = {"ids": post_spread(session, b, "sell_etf", qty),
+                                   "since": tick}
+                    else:
+                        trade_arb(session, b, "sell_etf", qty)
                 elif etf_cheap > floor and qty:
-                    trade_arb(session, b, "buy_etf", qty)
+                    if EXECUTION == "limit":
+                        working = {"ids": post_spread(session, b, "buy_etf", qty),
+                                   "since": tick}
+                    else:
+                        trade_arb(session, b, "buy_etf", qty)
                 # nothing else: an open spread is held to settlement
 
                 sleep(LOOP_SLEEP)
