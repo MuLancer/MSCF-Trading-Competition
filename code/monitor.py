@@ -1,107 +1,204 @@
 """
-Watch heats go by and keep a per-heat scorecard. Read-only: places no orders.
+Watch heats and keep enough of a record to argue with afterwards. Read-only.
 
-    python3 monitor.py                 # follow live, append to heats.csv
-    python3 monitor.py --quiet         # only the per-heat summary lines
+    python3 -u monitor.py          # follow live, recording to ticks.csv
+    python3 monitor.py --quiet     # same, only the per-heat lines
+    python3 monitor.py --review    # post-mortem over everything recorded
 
-Run it in a second terminal beside vol_strategy.py. It samples /trader for
-P&L and fines and /securities for the book, notices when a heat rolls over,
-and writes one row per finished heat so the practice runs can be compared
-instead of remembered.
+Run the live mode in a second terminal beside vol_strategy.py. It never
+places an order; it samples /trader, /securities and /news and writes a row
+per tick, so a heat can be taken apart later instead of remembered.
 
-The delta columns are the ones that explain the fines: the CRO charges $0.10
-a second for every unit past 7,000, so `over` (ticks spent past the line) and
-`peak` say where a fine came from, which the P&L alone never does.
+The review mode is the point. P&L alone never says why a heat went the way it
+did: it cannot tell a fine from a loss, a missed trade from an absent one, or
+a position that drifted from one that was never hedged. The recorded columns
+are chosen so those are all separable.
 """
 
 import csv
 import os
 import sys
 import time
-from datetime import datetime
 
 import requests
 
 import vol_strategy as vs
 
-CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heats.csv")
-COLUMNS = ["finished", "ticks", "pnl", "fines", "pnl_net",
-           "peak_delta", "ticks_over_limit", "max_opt_gross", "max_opt_net"]
+HERE = os.path.dirname(os.path.abspath(__file__))
+# ticks.csv is the only thing written, one row as each tick happens. Heat
+# summaries are derived from it on demand rather than written at shutdown:
+# a monitor that is killed rather than asked to stop still leaves its record.
+TICKS_CSV = os.path.join(HERE, "ticks.csv")
+
+TICK_COLUMNS = ["heat", "tick", "week", "pnl", "fines", "delta", "rtm",
+                "opt_gross", "opt_net", "forecast", "mkt_iv", "signals",
+                "room", "book_delta"]
+FINE_RATE = 0.10          # $ per second per unit past the limit
 
 
-class HeatRecord:
-    def __init__(self):
-        self.ticks = 0
-        self.pnl = 0.0
-        self.fines = 0.0
-        self.peak_delta = 0.0
-        self.ticks_over = 0
-        self.max_gross = 0
-        self.max_net = 0
-
-    def observe(self, pnl, fines, delta, gross, net):
-        self.ticks += 1
-        self.pnl, self.fines = pnl, fines
-        if abs(delta) > abs(self.peak_delta):
-            self.peak_delta = delta
-        if abs(delta) > vs.DELTA_HARD_LIMIT:
-            self.ticks_over += 1
-        self.max_gross = max(self.max_gross, int(abs(gross)))
-        self.max_net = max(self.max_net, int(abs(net)))
-
-    def row(self):
-        return {
-            "finished": datetime.now().strftime("%H:%M:%S"),
-            "ticks": self.ticks,
-            "pnl": round(self.pnl, 2),
-            "fines": round(self.fines, 2),
-            "pnl_net": round(self.pnl - self.fines, 2),
-            "peak_delta": int(self.peak_delta),
-            "ticks_over_limit": self.ticks_over,
-            "max_opt_gross": self.max_gross,
-            "max_opt_net": self.max_net,
-        }
-
-
-def append_csv(row):
-    fresh = not os.path.exists(CSV_PATH)
-    with open(CSV_PATH, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
+def append(path, columns, row):
+    fresh = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
         if fresh:
             w.writeheader()
         w.writerow(row)
 
 
-def print_summary():
-    if not os.path.exists(CSV_PATH):
-        return
-    with open(CSV_PATH) as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        return
-    print(f"\n{'#':>3}{'ticks':>7}{'P&L':>12}{'fines':>10}{'net':>12}"
-          f"{'peak Δ':>10}{'over':>6}")
-    for i, r in enumerate(rows, 1):
-        print(f"{i:>3}{r['ticks']:>7}{float(r['pnl']):>12,.0f}"
-              f"{float(r['fines']):>10,.0f}{float(r['pnl_net']):>12,.0f}"
-              f"{int(r['peak_delta']):>10,}{r['ticks_over_limit']:>6}")
-    nets = [float(r["pnl_net"]) for r in rows]
-    fines = [float(r["fines"]) for r in rows]
-    print(f"{'':>3}{'':>7}{'':>12}{'':>10}{'-'*11:>12}")
-    print(f"{'avg':>3}{'':>7}{'':>12}{sum(fines)/len(fines):>10,.0f}"
-          f"{sum(nets)/len(nets):>12,.0f}")
-    print(f"{'min':>3}{'':>7}{'':>12}{'':>10}{min(nets):>12,.0f}"
-          "   <- ranking is by average heat rank, so the floor matters")
+def next_heat_number():
+    for r in reversed(read_ticks()):
+        return int(r["heat"]) + 1
+    return 1
 
 
-def main(quiet):
+def read_ticks():
+    if not os.path.exists(TICKS_CSV):
+        return []
+    with open(TICKS_CSV) as f:
+        return list(csv.DictReader(f))
+
+
+def summarise(heat_no, rows):
+    """Derive a heat's scorecard from its ticks, causes kept separate."""
+    pnls = [float(r["pnl"]) for r in rows]
+    peak, drawdown = pnls[0], 0.0
+    for p in pnls:
+        peak = max(peak, p)
+        drawdown = max(drawdown, peak - p)
+
+    deltas = [float(r["delta"]) for r in rows]
+    over = [d for d in deltas if abs(d) > vs.DELTA_HARD_LIMIT]
+    return {
+        "heat": heat_no,
+        "ticks": len(rows),
+        "pnl": pnls[-1],
+        "fines": float(rows[-1]["fines"]),
+        "pnl_net": pnls[-1] - float(rows[-1]["fines"]),
+        "peak_delta": max(deltas, key=abs, default=0),
+        "ticks_over_limit": len(over),
+        "fine_from_delta": sum((abs(d) - vs.DELTA_HARD_LIMIT) * FINE_RATE
+                               for d in over),
+        "max_drawdown": drawdown,
+        # edge was there but the budget was not
+        "ticks_blocked": sum(1 for r in rows
+                             if int(r["signals"]) and not int(r["room"])),
+        # no edge to act on at all
+        "ticks_idle": sum(1 for r in rows if not int(r["signals"])),
+    }
+
+
+def sample(session, state, tick):
+    """One read-only snapshot of everything worth keeping."""
+    trader = vs.api_request(session, "GET", "trader")
+    securities = vs.get_securities(session)
+    if trader is None or securities is None:
+        return None
+    vs.update_vol_state(session, state)
+
+    forecast = vs.blended_vol(state, tick) if state["seeded"] else 0.0
+    rows = vs.build_signal_table(securities, forecast, tick, state["risk_free"])
+    legs = vs.option_legs(securities)
+    quoted = [r["market_iv"] for r in rows if r["market_iv"]]
+
+    return {
+        "tick": tick,
+        "week": vs.week_of(tick),
+        "pnl": round(trader["nlv"], 2),
+        "fines": round(trader["total_fines"], 2),
+        "delta": round(vs.portfolio_delta(securities, rows)),
+        "rtm": int(next(x["position"] for x in securities
+                        if x["ticker"] == vs.UNDERLYING)),
+        "opt_gross": int(sum(abs(x["position"]) for x in legs)),
+        "opt_net": int(sum(x["position"] for x in legs)),
+        "forecast": round(forecast, 4),
+        "mkt_iv": round(sum(quoted) / len(quoted), 4) if quoted else "",
+        "signals": len(vs.select_trades(rows)),
+        "room": int(max(vs.option_room(legs, tick)[0], 0)),
+        "book_delta": round(sum(r["delta"] * r["position"] * vs.CONTRACT_SIZE
+                                for r in rows)),
+    }
+
+
+def close_heat(heat_no, samples):
+    """Report a finished heat. Nothing to persist -- the ticks already are."""
+    if not samples:
+        return None
+    return summarise(heat_no, [{k: str(v) for k, v in s.items()}
+                               for s in samples])
+
+
+# ------------------------------------------------------------------- review
+def review():
+    ticks = read_ticks()
+    if not ticks:
+        print("nothing recorded yet -- run the live mode through a heat first")
+        return
+
+    heats, order = {}, []
+    for r in ticks:
+        h = int(r["heat"])
+        if h not in heats:
+            heats[h] = []
+            order.append(h)
+        heats[h].append(r)
+    summaries = [summarise(h, heats[h]) for h in order]
+
+    print(f"{'#':>3}{'ticks':>7}{'P&L':>11}{'fines':>9}{'net':>11}"
+          f"{'drawdn':>9}{'peak d':>9}{'over':>6}{'blocked':>9}{'idle':>6}")
+    for x in summaries:
+        partial = "" if x["ticks"] > 250 else "  (partial)"
+        print(f"{x['heat']:>3}{x['ticks']:>7}{x['pnl']:>11,.0f}"
+              f"{x['fines']:>9,.0f}{x['pnl_net']:>11,.0f}"
+              f"{x['max_drawdown']:>9,.0f}{x['peak_delta']:>9,.0f}"
+              f"{x['ticks_over_limit']:>6}{x['ticks_blocked']:>9}"
+              f"{x['ticks_idle']:>6}{partial}")
+
+    full = [x for x in summaries if x["ticks"] > 250]
+    if full:
+        nets = [x["pnl_net"] for x in full]
+        print(f"\n  complete heats: {len(full)}")
+        print(f"  average net {sum(nets)/len(nets):>12,.0f}")
+        print(f"  worst heat  {min(nets):>12,.0f}   "
+              "<- ranking averages heat ranks, so the floor costs places")
+
+    print("\n--- where it went ---")
+    for x in summaries:
+        if x["fines"] >= 1:
+            share = 100 * x["fines"] / max(abs(x["pnl"]), 1)
+            print(f"  heat {x['heat']}: fines {x['fines']:,.0f} "
+                  f"= {share:.0f}% of P&L over {x['ticks_over_limit']} ticks "
+                  f"past the line (delta accounts for ~{x['fine_from_delta']:,.0f})")
+    if all(x["fines"] < 1 for x in summaries):
+        print("  no fines recorded")
+
+    blocked = sum(x["ticks_blocked"] for x in summaries)
+    idle = sum(x["ticks_idle"] for x in summaries)
+    total = sum(x["ticks"] for x in summaries)
+    print(f"\n  {blocked} of {total} ticks ({100*blocked//max(total,1)}%) had "
+          "signals and no budget   <- capacity, not the model")
+    print(f"  {idle} of {total} ticks ({100*idle//max(total,1)}%) had no signal "
+          "at all          <- no edge; idling was right")
+
+    stuck = sum(1 for a, b in zip(ticks, ticks[1:])
+                if a["heat"] == b["heat"] and a["rtm"] == b["rtm"]
+                and abs(float(b["delta"])) > vs.DELTA_HARD_LIMIT)
+    if stuck:
+        print(f"\n  {stuck} ticks sat past the fine line without the hedge moving")
+        print("     -> the strategy was stopped, or the hedge had no room left")
+
+    print(f"\n  detail: {TICKS_CSV}")
+
+
+# --------------------------------------------------------------------- live
+def live(quiet):
     session = requests.Session()
     session.headers.update(vs.AUTHORIZATION)
     state = vs.new_vol_state()
-    heat = HeatRecord()
+    heat_no = next_heat_number()
+    samples = []
     last_tick = None
 
-    print(f"monitoring {vs.API_ENDPOINT}  (Ctrl+C to stop)\n")
+    print(f"monitoring {vs.API_ENDPOINT}   heat #{heat_no}   (Ctrl+C to stop)\n")
     while True:
         try:
             tick, status = vs.get_case(session)
@@ -109,14 +206,14 @@ def main(quiet):
                 time.sleep(1)
                 continue
 
-            if last_tick is not None and tick < last_tick and heat.ticks:
-                row = heat.row()
-                append_csv(row)
-                print(f"\n=== heat done: P&L {row['pnl']:,.0f}  "
+            if last_tick is not None and tick < last_tick and samples:
+                row = close_heat(heat_no, samples)
+                print(f"\n=== heat {heat_no}: P&L {row['pnl']:,.0f}  "
                       f"fines {row['fines']:,.0f}  net {row['pnl_net']:,.0f}  "
-                      f"peak Δ {row['peak_delta']:,}  "
+                      f"drawdown {row['max_drawdown']:,.0f}  "
                       f"{row['ticks_over_limit']} ticks over ===\n")
-                heat = HeatRecord()
+                heat_no += 1
+                samples = []
                 state = vs.new_vol_state()
 
             if status != "ACTIVE" or tick == last_tick:
@@ -124,34 +221,33 @@ def main(quiet):
                 continue
             last_tick = tick
 
-            trader = vs.api_request(session, "GET", "trader")
-            securities = vs.get_securities(session)
-            if trader is None or securities is None:
+            snap = sample(session, state, tick)
+            if snap is None:
                 continue
-            vs.update_vol_state(session, state)
-
-            forecast = vs.blended_vol(state, tick) if state["seeded"] else 0.2
-            rows = vs.build_signal_table(securities, forecast, tick,
-                                         state["risk_free"])
-            delta = vs.portfolio_delta(securities, rows)
-            legs = vs.option_legs(securities)
-            gross = sum(abs(x["position"]) for x in legs)
-            net = sum(x["position"] for x in legs)
-            heat.observe(trader["nlv"], trader["total_fines"], delta, gross, net)
+            samples.append(snap)
+            append(TICKS_CSV, TICK_COLUMNS, dict(snap, heat=heat_no))
 
             if not quiet:
-                flag = "  <-- OVER" if abs(delta) > vs.DELTA_HARD_LIMIT else ""
-                print(f"t={tick:>3} vol={forecast:.3f} pnl={trader['nlv']:>10,.0f} "
-                      f"fines={trader['total_fines']:>8,.0f} "
-                      f"delta={delta:>9,.0f} opt={int(net):>5}{flag}")
+                flag = "  <-- OVER" if abs(snap["delta"]) > vs.DELTA_HARD_LIMIT else ""
+                print(f"t={tick:>3} wk={snap['week']} "
+                      f"vol={snap['forecast']:.3f} mkt={snap['mkt_iv'] or 0:.3f} "
+                      f"pnl={snap['pnl']:>9,.0f} fines={snap['fines']:>7,.0f} "
+                      f"Δ={snap['delta']:>8,} sig={snap['signals']:>2} "
+                      f"room={snap['room']:>4}{flag}")
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"  {type(e).__name__}: {e}")
             time.sleep(1)
 
-    print_summary()
+    if samples:
+        close_heat(heat_no, samples)
+    print()
+    review()
 
 
 if __name__ == "__main__":
-    main("--quiet" in sys.argv)
+    if "--review" in sys.argv:
+        review()
+    else:
+        live("--quiet" in sys.argv)

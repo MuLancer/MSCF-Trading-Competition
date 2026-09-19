@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 venv/
 heats.csv
+ticks.csv
