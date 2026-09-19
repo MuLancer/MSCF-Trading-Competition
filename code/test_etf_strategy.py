@@ -162,6 +162,24 @@ def test_converter_makes_a_large_tender_executable():
         es.fetch_book = original
 
 
+def test_positions_are_held_to_settlement():
+    """There is no timer unwind: settlement is a free exit at fair value."""
+    assert not hasattr(es, "MAX_POSITION_TICKS"), "the timer unwind is gone"
+
+    # a position needs enough ticks left to earn back what entry costs
+    assert es.MIN_TICKS_TO_EARN_ENTRY == int(es.ENTRY_SLIPPAGE
+                                             / es.HOLD_RETURN_PER_TICK)
+    assert 60 < es.MIN_TICKS_TO_EARN_ENTRY < 90, es.MIN_TICKS_TO_EARN_ENTRY
+
+    # entering at tick 150 pays for itself twice over; at 250 it does not
+    earns_from = lambda t: (es.TOTAL_TICKS - t) * es.HOLD_RETURN_PER_TICK
+    assert earns_from(150) > es.ENTRY_SLIPPAGE
+    assert earns_from(250) < es.ENTRY_SLIPPAGE
+    print(f"PASS  positions_are_held_to_settlement "
+          f"(needs {es.MIN_TICKS_TO_EARN_ENTRY} ticks of runway; "
+          f"tick 150 earns {earns_from(150):.2f}/sh, tick 250 only {earns_from(250):.2f})")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

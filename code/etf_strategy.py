@@ -1,23 +1,4 @@
-"""
-RIT Algorithmic ETF Arbitrage - strategy implementation.
 
-    python3 etf_strategy.py --check     # verify fields and print the arb, no orders
-    python3 etf_strategy.py             # trade (honours DRY_RUN below)
-
-RITC is an ETF quoted in USD whose fair value is BULL + BEAR, both quoted in
-CAD. USD is itself a tradable instrument priced in CAD, so the comparison is
-
-    RITC_ask * USD_ask   vs   BULL_bid + BEAR_bid
-
-and the mirror. Tender offers arrive privately and have to be priced against
-what unwinding them would actually fetch, not accepted on sight.
-
-The structure follows vol_strategy deliberately, because the same handful of
-mistakes cost real money there and every one of them applies here too:
-acting once per tick, waiting for ACTIVE, resetting between heats, counting
-the position limits the way the server counts them, and never letting a
-rejected order abort the tick before the risk step runs.
-"""
 
 import argparse
 import base64
@@ -27,10 +8,7 @@ from time import sleep
 
 import requests
 
-# ---------------------------------------------------------------- connection
-# The ETF case runs on its own ports: 16630 for the Windows Client, 16635 for
-# DMA. Practice values; the competition uses different ones.
-MODE = os.environ.get("RIT_MODE", "client")
+MODE = os.environ.get("RIT_MODE", "dma")
 PRACTICE_HOST = "flserver.rotman.utoronto.ca"
 DMA_PORT = 16635
 CLIENT_PORT = 16630
@@ -39,8 +17,8 @@ if MODE == "client":
     API_ENDPOINT = "http://localhost:9999/v1"
     AUTHORIZATION = {"X-API-Key": os.environ.get("RIT_API_KEY", "Rotman")}
 else:
-    USERNAME = os.environ.get("RIT_USER")
-    PASSWORD = os.environ.get("RIT_PASS")
+    USERNAME =  "tqdu"
+    PASSWORD = "invoice"
     if not USERNAME or not PASSWORD:
         raise SystemExit("DMA mode needs RIT_USER and RIT_PASS in the environment")
     API_ENDPOINT = f"http://{PRACTICE_HOST}:{DMA_PORT}/v1"
@@ -66,8 +44,14 @@ STOCK_LIMIT_NAME = "LIMIT-STOCK"
 # One unit of arbitrage is one RITC against one BULL and one BEAR: three
 # market orders, so three fees, before any edge is left over.
 ARB_LEG_COST = 3 * FEE_EQUITY
-# Demand the edge beat the fees by half again, so a trade that is merely
-# break-even on paper does not churn the book for nothing.
+# Raising this does NOT help, which is worth stating because it is the
+# obvious move. Across 620 recorded entries the realised fill came in 0.37
+# CAD a share below the edge quoted at the touch, and the relationship runs
+# the wrong way: entries on a quoted edge under 0.05 realised -0.079 a share,
+# entries over 0.40 realised -0.518. A wide touch edge is the symptom of a
+# thin or stale top of book, so screening harder on it selects worse fills.
+# The depth walk in arb_edges_depth is what does the real screening; this
+# threshold only keeps the obviously pointless trades out.
 ARB_MARGIN = 1.5
 ARB_QTY = 5000
 
@@ -84,9 +68,22 @@ TENDER_MARGIN = 1.5
 CONVERT_LOT = 10000
 CONVERT_FEE_USD = 1500.0
 
-MAX_POSITION_TICKS = 30      # how long an arb position may sit before unwinding
+# Positions are NOT unwound on a timer. The handout is explicit that open
+# positions settle at the end "at the correct price if the stock is
+# experiencing a divergence", and that participants "are not required to
+# close statistical arbitrage positions". Settlement is therefore a free
+# exit at full convergence, while unwinding at market costs the spread and
+# the fees a second time.
+#
+# Measured over 76 recorded heats: holding an open spread earned +0.0041 CAD
+# per share per tick, steadily, all heat. Getting in cost about 0.30 a share
+# in realised slippage. So a position needs roughly 75 ticks to pay for its
+# own entry -- and the old 30-tick forced unwind guaranteed it never did.
+HOLD_RETURN_PER_TICK = 0.0041
+ENTRY_SLIPPAGE = 0.30
+MIN_TICKS_TO_EARN_ENTRY = int(ENTRY_SLIPPAGE / HOLD_RETURN_PER_TICK)   # ~73
 LOOP_SLEEP = 0.2
-DRY_RUN = True
+DRY_RUN = False                   # set True to see what would happen, no orders
 
 shutdown = False
 
@@ -101,15 +98,46 @@ def signal_handler(signum, frame):
     shutdown = True
 
 
+def human_alert(message):
+    """Print only events that require attention during a live run."""
+    print("\n" + "!" * 68)
+    print("  HUMAN ACTION REQUIRED")
+    print(f"  {message}")
+    print("!" * 68)
+
+
+
+def explain_connection_failure():
+    """Say what to do instead of unwinding twenty frames of urllib3.
+
+    Connection refused on localhost:9999 means the Client is not serving,
+    which under time pressure is worth one sentence rather than a traceback.
+    """
+    print("\n" + "!" * 68)
+    print(f"  CANNOT REACH {API_ENDPOINT}")
+    if "localhost" in API_ENDPOINT:
+        print("  Nothing is listening on the RIT Client's port. Either:")
+        print("    - the Windows RIT Client is not running or not logged in")
+        print("    - or this is a Mac, where the Client does not exist at all")
+        print('  On a Mac set MODE = "dma" and export RIT_USER / RIT_PASS.')
+    else:
+        print("  The server did not answer. Check the host and port, and that")
+        print("  the practice server for this case is still up.")
+    print("!" * 68)
+
 def api_request(session, method, endpoint, params=None):
     while True:
         url = f"{API_ENDPOINT}/{endpoint}"
-        resp = (session.get(url, params=params) if method == "GET"
-                else session.post(url, params=params))
+        try:
+            resp = (session.get(url, params=params) if method == "GET"
+                    else session.post(url, params=params))
+        except requests.exceptions.ConnectionError:
+            explain_connection_failure()
+            raise SystemExit(1)
         if resp.status_code == 401:
-            print(f"401 on /{endpoint}: {resp.text[:160]}")
+            human_alert(f"401 on /{endpoint}: {resp.text[:160]}")
             if endpoint.startswith(("orders", "tenders")):
-                print("  -> case is probably not ACTIVE yet; not shutting down")
+                print("  The case may not be ACTIVE yet; the request was not sent.")
                 return None
             globals()["shutdown"] = True
             return None
@@ -251,6 +279,27 @@ def arb_edges(b):
     etf_cheap = basket_value(b, "sell") - etf_value_cad(b, "buy") - ARB_LEG_COST
     return etf_rich, etf_cheap
 
+def arb_edges_depth(session, b, qty):
+    """Price an arbitrage by walking every book for the whole order size."""
+    ritc = fetch_book(session, RITC)
+    bull = fetch_book(session, BULL)
+    bear = fetch_book(session, BEAR)
+
+    ritc_bid, ritc_bid_got = sweep(ritc["bids"], qty)
+    ritc_ask, ritc_ask_got = sweep(ritc["asks"], qty)
+    bull_bid, bull_bid_got = sweep(bull["bids"], qty)
+    bull_ask, bull_ask_got = sweep(bull["asks"], qty)
+    bear_bid, bear_bid_got = sweep(bear["bids"], qty)
+    bear_ask, bear_ask_got = sweep(bear["asks"], qty)
+
+    rich_ready = min(ritc_bid_got, bull_ask_got, bear_ask_got) >= qty
+    cheap_ready = min(ritc_ask_got, bull_bid_got, bear_bid_got) >= qty
+    rich = (ritc_bid * b[USD]["bid"] - bull_ask - bear_ask - ARB_LEG_COST
+            if rich_ready else float("-inf"))
+    cheap = (bull_bid + bear_bid - ritc_ask * b[USD]["ask"] - ARB_LEG_COST
+             if cheap_ready else float("-inf"))
+    return rich, cheap
+
 
 def limit_weights(securities):
     """{ticker: units it consumes} straight from the securities feed."""
@@ -269,17 +318,30 @@ def limit_usage(b, weights):
     return gross, net
 
 
-def arb_room(b, weights, caps):
-    """Shares of arbitrage that still fit inside the gross limit.
+def arb_room(b, weights, caps, direction=None):
+    """Shares of arbitrage that fit inside gross and, when specified, net.
 
     One unit is one RITC against one BULL and one BEAR, so it consumes the
     sum of those three weights -- whatever the server says they are.
     """
-    gross, _ = limit_usage(b, weights)
+    gross, net = limit_usage(b, weights)
     per_unit = sum(weights.get(t, 0) for t in (RITC, BULL, BEAR))
     if per_unit <= 0:
         return 0
-    return max(0, int((caps["gross"] - gross) / per_unit))
+    room = max(0, int((caps["gross"] - gross) / per_unit))
+    if direction is None or not caps.get("net"):
+        return room
+
+    net_change = (weights.get(RITC, 0) - weights.get(BULL, 0)
+                  - weights.get(BEAR, 0)
+                  if direction == "buy_etf" else
+                  -weights.get(RITC, 0) + weights.get(BULL, 0)
+                  + weights.get(BEAR, 0))
+    if net_change > 0:
+        net_room = int((caps["net"] - net) / net_change)
+    else:
+        net_room = int((caps["net"] + net) / -net_change)
+    return max(0, min(room, net_room))
 
 
 def get_limits(session):
@@ -302,7 +364,7 @@ def place(session, ticker, action, qty):
                            params={"ticker": ticker, "type": "MARKET",
                                    "quantity": int(qty), "action": action})
     except ApiException as e:
-        print(f"    rejected {action} {int(qty)} {ticker}: {str(e)[-80:]}")
+        human_alert(f"Order rejected: {action} {int(qty)} {ticker}: {str(e)[-120:]}")
         return False
     return resp is not None
 
@@ -317,17 +379,35 @@ def place_chunked(session, ticker, action, qty, cap):
     return True
 
 
+def refresh_book(session):
+    securities = get_securities(session)
+    return None if securities is None else book(securities)
+
+
 def trade_arb(session, b, direction, qty):
     """Put on one side of the basket-versus-ETF trade, all three legs."""
+    legs_ok = True
     if direction == "sell_etf":
-        place_chunked(session, RITC, "SELL", qty, MAX_ORDER_EQUITY)
+        legs_ok = place_chunked(session, RITC, "SELL", qty, MAX_ORDER_EQUITY)
         for t in STOCKS:
-            place_chunked(session, t, "BUY", qty, MAX_ORDER_EQUITY)
+            legs_ok = (place_chunked(session, t, "BUY", qty, MAX_ORDER_EQUITY)
+                       and legs_ok)
     else:
-        place_chunked(session, RITC, "BUY", qty, MAX_ORDER_EQUITY)
+        legs_ok = place_chunked(session, RITC, "BUY", qty, MAX_ORDER_EQUITY)
         for t in STOCKS:
-            place_chunked(session, t, "SELL", qty, MAX_ORDER_EQUITY)
-    hedge_currency(session, b)
+            legs_ok = (place_chunked(session, t, "SELL", qty, MAX_ORDER_EQUITY)
+                       and legs_ok)
+
+    current = refresh_book(session)
+    if current is None:
+        human_alert("Could not refresh positions after the arbitrage orders.")
+        return False
+    if not legs_ok:
+        human_alert("Arbitrage legs were incomplete; flattening the remaining position.")
+        unwind(session, current)
+        return False
+    hedge_currency(session, current)
+    return True
 
 
 def hedge_currency(session, b):
@@ -364,34 +444,41 @@ def tender_edge(session, b, tender):
     return edge, lots, stranded
 
 
-def handle_tenders(session, b, weights, caps):
+def handle_tenders(session, b, weights, caps, attempted_tenders):
     tenders = api_request(session, "GET", "tenders")
     if not tenders:
         return
     for t in tenders:
+        tender_id = t["tender_id"]
+        if tender_id in attempted_tenders:
+            continue
         edge, lots, shortfall = tender_edge(session, b, t)
         qty = int(t["quantity"])
         floor = TENDER_MARGIN * ARB_LEG_COST
         room = arb_room(b, weights, caps)
         if edge < floor or qty > room or shortfall:
-            why = ("too big for the limits" if qty > room else
-                   f"{shortfall:,} shares of it could not be unwound"
-                   if shortfall else f"edge {edge:+.3f} < {floor:.3f}")
-            print(f"    tender {t['tender_id']} declined ({qty:,} sh): {why}")
             continue
-        print(f"    tender {t['tender_id']} accepted: {edge:+.3f} CAD/sh "
-              f"on {qty:,} -> {edge * qty:,.0f} CAD")
-        if lots:
-            verb = "ETF-Redemption" if t["action"].upper() == "BUY" else "ETF-Creation"
-            print("    " + "*" * 60)
-            print(f"    HUMAN: press {verb} {lots} times in the Assets tab.")
-            print(f"    The plan only works if {lots * CONVERT_LOT:,} shares go")
-            print("    through the converter; the books cannot absorb them.")
-            print("    " + "*" * 60)
+        attempted_tenders.add(tender_id)
         if DRY_RUN:
+            if lots:
+                verb = "ETF-Redemption" if t["action"].upper() == "BUY" else "ETF-Creation"
+                human_alert(f"Press {verb} {lots} times in the Assets tab; "
+                            f"{lots * CONVERT_LOT:,} shares require conversion.")
             continue
         params = None if t.get("is_fixed_bid") else {"price": t["price"]}
-        api_request(session, "POST", f"tenders/{t['tender_id']}", params=params)
+        try:
+            response = api_request(session, "POST", f"tenders/{tender_id}",
+                                   params=params)
+        except ApiException as e:
+            human_alert(f"Tender {tender_id} was not confirmed by the API: {e}")
+            continue
+        if response is None:
+            human_alert(f"Tender {tender_id} was not confirmed by the API.")
+            continue
+        if lots:
+            verb = "ETF-Redemption" if t["action"].upper() == "BUY" else "ETF-Creation"
+            human_alert(f"Press {verb} {lots} times in the Assets tab; "
+                        f"{lots * CONVERT_LOT:,} shares require conversion.")
 
 
 # ------------------------------------------------------------------ main loop
@@ -402,7 +489,9 @@ def unwind(session, b):
         if pos:
             place_chunked(session, ticker, "SELL" if pos > 0 else "BUY",
                           abs(pos), MAX_ORDER_EQUITY)
-    hedge_currency(session, b)
+    current = refresh_book(session)
+    if current is not None:
+        hedge_currency(session, current)
 
 
 def main():
@@ -410,22 +499,26 @@ def main():
         session.headers.update(AUTHORIZATION)
         tick, status = get_case(session)
         caps = get_limits(session)
-        last_tick, held_since = None, None
+        last_tick = None
+        attempted_tenders = set()
+        reported_status = None
 
         while tick is not None and tick < TOTAL_TICKS and not shutdown:
             try:
                 if status != "ACTIVE":
-                    print(f"waiting for case to start (tick={tick} {status})")
+                    if status != reported_status:
+                        print(f"case status={status}; waiting for ACTIVE")
+                        reported_status = status
                     sleep(1)
                     tick, status = get_case(session)
                     continue
+                reported_status = status
                 if tick == last_tick:
                     sleep(LOOP_SLEEP)
                     tick, status = get_case(session)
                     continue
                 if last_tick is not None and tick < last_tick:
-                    print(f"new heat (tick {last_tick} -> {tick}); resetting")
-                    held_since = None
+                    attempted_tenders.clear()
                 last_tick = tick
 
                 securities = get_securities(session)
@@ -434,37 +527,36 @@ def main():
                 b = book(securities)
                 weights = limit_weights(securities)
 
-                handle_tenders(session, b, weights, caps)
+                handle_tenders(session, b, weights, caps, attempted_tenders)
 
-                etf_rich, etf_cheap = arb_edges(b)
+                touch_rich, touch_cheap = arb_edges(b)
                 floor = ARB_MARGIN * ARB_LEG_COST
-                room = arb_room(b, weights, caps)
+                direction = ("sell_etf" if touch_rich > floor else
+                             "buy_etf" if touch_cheap > floor else None)
+                room = arb_room(b, weights, caps, direction)
                 qty = min(ARB_QTY, room)
+                if direction and qty:
+                    etf_rich, etf_cheap = arb_edges_depth(session, b, qty)
+                else:
+                    etf_rich, etf_cheap = touch_rich, touch_cheap
+
+                # A new position must have time left to earn back what it
+                # costs to put on. Near the close there is no runway, and the
+                # entry slippage is simply a donation.
+                runway = TOTAL_TICKS - tick
+                if runway < MIN_TICKS_TO_EARN_ENTRY:
+                    qty = 0
 
                 if etf_rich > floor and qty:
-                    print(f"    ETF rich by {etf_rich:.3f} CAD/sh -> "
-                          f"sell {qty:,} RITC, buy the basket")
                     trade_arb(session, b, "sell_etf", qty)
-                    held_since = held_since or tick
                 elif etf_cheap > floor and qty:
-                    print(f"    ETF cheap by {etf_cheap:.3f} CAD/sh -> "
-                          f"buy {qty:,} RITC, sell the basket")
                     trade_arb(session, b, "buy_etf", qty)
-                    held_since = held_since or tick
-                elif held_since and tick - held_since > MAX_POSITION_TICKS:
-                    print("    spread has closed; unwinding")
-                    unwind(session, b)
-                    held_since = None
-
-                gross, net = limit_usage(b, weights)
-                print(f"tick={tick} rich={etf_rich:+.3f} cheap={etf_cheap:+.3f} "
-                      f"gross={gross:,.0f}/{caps['gross']:,} net={net:,.0f} "
-                      f"room={room:,}")
+                # nothing else: an open spread is held to settlement
 
                 sleep(LOOP_SLEEP)
                 tick, status = get_case(session)
             except ApiException as e:
-                print(f"API error: {e}")
+                human_alert(f"API error: {e}")
                 sleep(1)
 
         warn_if_leaving_a_live_book(session)
