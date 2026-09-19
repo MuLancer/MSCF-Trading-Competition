@@ -200,14 +200,21 @@ def test_option_book_capped_to_hedge_capacity():
     call = {"ticker": "RTM50C", "action": "BUY", "delta": 0.5}
     assert vs.MAX_OPTION_DELTA == 35000
 
+    early = 1   # full allowance this early in the heat
     # the budget is returned raw; the caller mins it with the order cap
-    assert vs.hedgeable_qty(call, 0) > vs.OPT_MAX_ORDER
+    assert vs.hedgeable_qty(call, 0, early) > vs.OPT_MAX_ORDER
     # already near the cap -> only a sliver fits, below a full order
-    assert vs.hedgeable_qty(call, 32000) == 60
+    assert vs.hedgeable_qty(call, 32000, early) == 60
     # at the cap -> nothing more in that direction
-    assert vs.hedgeable_qty(call, 35000) == 0
+    assert vs.hedgeable_qty(call, 35000, early) == 0
     # ...but trades that shrink the exposure are unrestricted
-    assert vs.hedgeable_qty(call, -35000) > vs.OPT_MAX_ORDER
+    assert vs.hedgeable_qty(call, -35000, early) > vs.OPT_MAX_ORDER
+
+    # the allowance winds down to nothing over the final stretch
+    assert vs.option_delta_budget(240) == vs.MAX_OPTION_DELTA
+    assert vs.option_delta_budget(270) == vs.MAX_OPTION_DELTA / 2
+    assert vs.option_delta_budget(300) == 0
+    assert vs.hedgeable_qty(call, 20000, 285) == 0, "no room left near expiry"
     print("PASS  option_book_capped_to_hedge_capacity")
 
 
@@ -335,12 +342,20 @@ def test_confirmation_clears_the_spent_forecast():
     print("PASS  confirmation_clears_the_spent_forecast")
 
 
-def test_net_budget_released_per_week():
-    assert [vs.net_room_for("SELL", 0, t) for t in (1, 80, 160, 240)] == [250, 500, 750, 1000]
+def test_net_budget_tracks_gross_not_its_own_ration():
+    """Rationing net per week as well as gross left 60% of gross unusable."""
+    caps = [vs.net_room_for("SELL", 0, t) for t in (1, 80, 160, 240)]
+    # week one is held to its gross budget; after that the hard limit governs
+    assert caps == [625, 1000, 1000, 1000], caps
+
+    # the live symptom: short 500 in week two, gross budget 1250
+    assert vs.net_room_for("SELL", -500, tick=80) == 500, "was 0 before"
+    assert vs.option_room([{"position": -500}], tick=80)[0] == 750
+
     # already short the week-one allowance: nothing left to sell, room to buy back
-    assert vs.net_room_for("SELL", -250, tick=1) == 0
-    assert vs.net_room_for("BUY", -250, tick=1) == 500
-    print("PASS  net_budget_released_per_week")
+    assert vs.net_room_for("SELL", -625, tick=1) == 0
+    assert vs.net_room_for("BUY", -625, tick=1) == 1250
+    print("PASS  net_budget_tracks_gross_not_its_own_ration")
 
 
 def test_order_size_capped_by_delta_impact():

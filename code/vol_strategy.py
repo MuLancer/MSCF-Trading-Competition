@@ -82,6 +82,9 @@ DELTA_BAND = 2500            # hedge trigger; below this, drift is left alone
 # offset, with room to spare for gamma near expiry. Past this the hedge runs
 # out of position limit and the delta cannot be brought back at all.
 MAX_OPTION_DELTA = 0.7 * RTM_GROSS_LIMIT
+# Over the final stretch the allowance above is wound down to zero, because
+# gamma makes the book unhedgeable exactly when the hedge has least room.
+WINDDOWN_TICKS = 60
 IV_GAP_THRESHOLD = 0.02      # min |market_iv - forecast| to trade; tune this
 MAX_NEW_TRADES_PER_TICK = 2
 # Required gross edge per contract, counted in round-trip commissions. Vega
@@ -457,7 +460,60 @@ def delta_capped_qty(order, running_delta, max_qty):
     return max(0, min(max_qty, int(allowed)))
 
 
-def hedgeable_qty(order, option_delta):
+def option_delta_budget(tick):
+    """How much delta the option book may carry at this point in the heat.
+
+    Gamma rises as expiry nears: the same book's delta swings further on the
+    same move, and the underlying leg cannot follow because it has its own
+    limit. A live heat held its size to the end, stopped trading at tick 267
+    with signals gone, and still watched delta drift to 33,555 on gamma alone
+    while the hedge sat pinned at -50,000. Shrinking the allowance over the
+    last stretch means the book is already small when it becomes hardest to
+    hold, and the options settle at intrinsic anyway.
+    """
+    remaining = max(TOTAL_TICKS - tick, 0)
+    if remaining >= WINDDOWN_TICKS:
+        return MAX_OPTION_DELTA
+    return MAX_OPTION_DELTA * remaining / WINDDOWN_TICKS
+
+
+def reduce_option_delta(session, rows, opt_delta, tick, max_orders=4):
+    """Trim the book back inside its delta budget, largest offender first.
+
+    Cutting one 100-lot a tick could not keep up: that is about 5,000 of
+    delta against a 33,000 gap, so the breach simply persisted and the fine
+    ran the whole time. Several legs may be trimmed in one tick.
+    """
+    budget = option_delta_budget(tick)
+    if abs(opt_delta) <= budget:
+        return opt_delta
+
+    book = {r["ticker"]: r["position"] for r in rows}
+    for _ in range(max_orders):
+        if abs(opt_delta) <= budget:
+            break
+        offenders = [r for r in rows
+                     if book[r["ticker"]]
+                     and (r["delta"] * book[r["ticker"]]) * opt_delta > 0]
+        if not offenders:
+            break
+        worst = max(offenders,
+                    key=lambda r: abs(r["delta"] * book[r["ticker"]]))
+        held = book[worst["ticker"]]
+        per_contract = abs(worst["delta"]) * CONTRACT_SIZE
+        qty = min(abs(held), OPT_MAX_ORDER,
+                  max(1, int((abs(opt_delta) - budget) / max(per_contract, 1e-9))))
+        action = "SELL" if held > 0 else "BUY"
+        print(f"    book delta {opt_delta:,.0f} over budget {budget:,.0f}; "
+              f"cutting {qty} {worst['ticker']}")
+        if not place_order(session, worst["ticker"], action, qty):
+            break
+        book[worst["ticker"]] = held - qty if held > 0 else held + qty
+        opt_delta -= (qty if held > 0 else -qty) * worst["delta"] * CONTRACT_SIZE
+    return opt_delta
+
+
+def hedgeable_qty(order, option_delta, tick):
     """Largest size that keeps the option book inside the hedge's reach.
 
     2,500 contracts can carry 250,000 of delta while the underlying leg stops
@@ -469,7 +525,8 @@ def hedgeable_qty(order, option_delta):
     per_contract = order_delta(order, 1)
     if per_contract == 0:
         return OPT_MAX_ORDER
-    edge = MAX_OPTION_DELTA if per_contract > 0 else -MAX_OPTION_DELTA
+    cap = option_delta_budget(tick)
+    edge = cap if per_contract > 0 else -cap
     return max(0, int((edge - option_delta) / per_contract))
 
 
@@ -481,11 +538,17 @@ def net_room_for(action, net_pos, tick=None):
     trades that would reduce the position and, worse, lets a second order in
     the same tick reuse headroom the first already spent.
 
-    Like the gross budget this is released a quarter per week. Spending the
-    whole net allowance early pins the book at the limit and leaves nothing
-    for the later shifts, which is exactly when the forecast is most useful.
+    The cap is the week's gross budget or the hard net limit, whichever binds
+    first: a net position cannot exceed the gross one, and past that the
+    case's own limit governs. Rationing net per week as well as gross was
+    double counting. It left 60% of the gross budget unusable -- a live heat
+    sat at the net cap for forty-five ticks with ten signals showing and 750
+    contracts of gross room it could not touch.
     """
-    cap = OPT_NET_LIMIT if tick is None else OPT_NET_LIMIT * week_of(tick) // 4
+    if tick is None:
+        cap = OPT_NET_LIMIT
+    else:
+        cap = min(OPT_NET_LIMIT, OPT_GROSS_LIMIT * week_of(tick) // 4)
     return cap - net_pos if action == "BUY" else cap + net_pos
 
 
@@ -612,7 +675,7 @@ def main():
                 for o in orders[:MAX_NEW_TRADES_PER_TICK]:
                     room = min(OPT_MAX_ORDER, gross_room,
                                net_room_for(o["action"], net_pos, tick),
-                               hedgeable_qty(o, opt_delta))
+                               hedgeable_qty(o, opt_delta, tick))
                     qty = delta_capped_qty(o, net_delta, room)
                     if qty <= 0:
                         continue
@@ -622,6 +685,10 @@ def main():
                         opt_delta += impact
                         net_pos += qty if o["action"] == "BUY" else -qty
                         gross_room -= qty
+
+                opt_delta = reduce_option_delta(session, rows, opt_delta, tick)
+                net_delta = opt_delta + next(x["position"] for x in securities
+                                             if x["ticker"] == UNDERLYING)
 
                 rtm_pos = next(x["position"] for x in securities
                                if x["ticker"] == UNDERLYING)
