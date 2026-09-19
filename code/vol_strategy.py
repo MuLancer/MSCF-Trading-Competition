@@ -78,6 +78,10 @@ DELTA_HARD_LIMIT = 7000      # CRO fine threshold
 # hedge trigger so a tick that takes a position is then flattened.
 MAX_TICK_DELTA = 3000        # most delta one tick's option orders may leave
 DELTA_BAND = 2500            # hedge trigger; below this, drift is left alone
+# The option book's own delta must stay inside what the underlying leg can
+# offset, with room to spare for gamma near expiry. Past this the hedge runs
+# out of position limit and the delta cannot be brought back at all.
+MAX_OPTION_DELTA = 0.7 * RTM_GROSS_LIMIT
 IV_GAP_THRESHOLD = 0.02      # min |market_iv - forecast| to trade; tune this
 MAX_NEW_TRADES_PER_TICK = 2
 # Required gross edge per contract, counted in round-trip commissions. Vega
@@ -273,6 +277,19 @@ def compute_market_iv(mid, S, K, T, right, risk_free=RISK_FREE):
 
 
 def build_signal_table(securities, current_vol, tick, risk_free=RISK_FREE):
+    """One row per option leg, whether or not its quote inverts.
+
+    Greeks come from our own forecast volatility, which always evaluates, so
+    every leg is represented. Only the mispricing fields need the inversion,
+    and a leg that will not invert carries iv_gap None: it is untradable but
+    still counts toward delta and the position limits.
+
+    Dropping those legs was what broke a live heat. At expiry two deep
+    in-the-money calls stopped inverting and took about 49,000 of delta out of
+    the total with them, so the book was hedged against a number of the wrong
+    sign, the underlying leg ran to its 50,000 limit, and the delta escaped to
+    -66,000 for the last forty ticks.
+    """
     T = time_to_expiry(tick)
     S = next(s["last"] for s in securities if s["ticker"] == UNDERLYING)
     rows = []
@@ -283,8 +300,6 @@ def build_signal_table(securities, current_vol, tick, risk_free=RISK_FREE):
         right, K = parsed
         mid = (s["bid"] + s["ask"]) / 2
         market_iv = compute_market_iv(mid, S, K, T, right, risk_free)
-        if market_iv is None:
-            continue
         rows.append({
             "ticker": s["ticker"],
             "right": right,
@@ -292,7 +307,7 @@ def build_signal_table(securities, current_vol, tick, risk_free=RISK_FREE):
             "position": s["position"],
             "mid": mid,
             "market_iv": market_iv,
-            "iv_gap": market_iv - current_vol,
+            "iv_gap": None if market_iv is None else market_iv - current_vol,
             "delta": bs_delta(right, S, K, T, risk_free, current_vol),
             "vega": bs_vega(right, S, K, T, risk_free, current_vol),
         })
@@ -320,7 +335,8 @@ def select_trades(rows, threshold=IV_GAP_THRESHOLD):
     """
     floor = MIN_EDGE_MULTIPLE * 2 * FEE_OPT
     picks = [r for r in rows
-             if abs(r["iv_gap"]) > threshold and expected_edge(r) > floor]
+             if r["iv_gap"] is not None
+             and abs(r["iv_gap"]) > threshold and expected_edge(r) > floor]
     picks.sort(key=expected_edge, reverse=True)
     return [{"ticker": r["ticker"],
              "action": "SELL" if r["iv_gap"] > 0 else "BUY",
@@ -439,6 +455,22 @@ def delta_capped_qty(order, running_delta, max_qty):
     edge = MAX_TICK_DELTA if per_contract > 0 else -MAX_TICK_DELTA
     allowed = (edge - running_delta) / per_contract
     return max(0, min(max_qty, int(allowed)))
+
+
+def hedgeable_qty(order, option_delta):
+    """Largest size that keeps the option book inside the hedge's reach.
+
+    2,500 contracts can carry 250,000 of delta while the underlying leg stops
+    at 50,000 shares, so a book built purely to the contract limit can grow a
+    delta no hedge can flatten. Each tick looked fine -- the net was trimmed
+    back every time -- but the underlying accumulated in one direction until
+    it hit its limit, and then the delta ran free.
+    """
+    per_contract = order_delta(order, 1)
+    if per_contract == 0:
+        return OPT_MAX_ORDER
+    edge = MAX_OPTION_DELTA if per_contract > 0 else -MAX_OPTION_DELTA
+    return max(0, int((edge - option_delta) / per_contract))
 
 
 def net_room_for(action, net_pos, tick=None):
@@ -575,14 +607,19 @@ def main():
                 # the hedge is placed, all within this same tick.
                 net_delta = portfolio_delta(securities, rows)
                 net_pos = sum(x["position"] for x in legs)
+                opt_delta = sum(r["delta"] * r["position"] * CONTRACT_SIZE
+                                for r in rows)
                 for o in orders[:MAX_NEW_TRADES_PER_TICK]:
                     room = min(OPT_MAX_ORDER, gross_room,
-                               net_room_for(o["action"], net_pos, tick))
+                               net_room_for(o["action"], net_pos, tick),
+                               hedgeable_qty(o, opt_delta))
                     qty = delta_capped_qty(o, net_delta, room)
                     if qty <= 0:
                         continue
                     if place_order(session, o["ticker"], o["action"], qty):
-                        net_delta += order_delta(o, qty)
+                        impact = order_delta(o, qty)
+                        net_delta += impact
+                        opt_delta += impact
                         net_pos += qty if o["action"] == "BUY" else -qty
                         gross_room -= qty
 

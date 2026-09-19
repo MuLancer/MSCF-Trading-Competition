@@ -166,6 +166,51 @@ def test_option_room():
     print("PASS  option_room")
 
 
+def test_unquotable_legs_still_carry_their_delta():
+    """The bug that cost a heat: dropped legs took ~49,000 of delta with them."""
+    positions = {"RTM48C": -142, "RTM49C": -362, "RTM50C": -526}
+    securities = make_market(S=49.92, mm_vol=0.31, tick=299, positions=positions)
+    for s in securities:          # deep ITM calls stop inverting at expiry
+        if s["ticker"] in ("RTM48C", "RTM49C"):
+            s["bid"], s["ask"] = 0.0, 0.0
+
+    rows = vs.build_signal_table(securities, current_vol=0.31, tick=299)
+    assert len(rows) == 10, "every leg must appear, quotable or not"
+
+    unquotable = [r for r in rows if r["iv_gap"] is None]
+    assert {r["ticker"] for r in unquotable} == {"RTM48C", "RTM49C"}
+    assert all(r["delta"] is not None for r in rows), "greeks come from our vol"
+
+    # they are excluded from trading but not from risk
+    assert all(o["ticker"] not in ("RTM48C", "RTM49C")
+               for o in vs.select_trades(rows))
+    hidden = sum(r["delta"] * r["position"] * 100 for r in unquotable)
+    assert hidden < -40000, hidden
+
+    total = vs.portfolio_delta(securities, rows)
+    visible_only = sum(r["delta"] * r["position"] * 100
+                       for r in rows if r["iv_gap"] is not None)
+    assert abs(total - visible_only) > 40000, "old code hedged the wrong number"
+    print(f"PASS  unquotable_legs_still_carry_their_delta "
+          f"(hidden {hidden:,.0f} of delta)")
+
+
+def test_option_book_capped_to_hedge_capacity():
+    """2,500 contracts can out-delta a 50,000 share hedge."""
+    call = {"ticker": "RTM50C", "action": "BUY", "delta": 0.5}
+    assert vs.MAX_OPTION_DELTA == 35000
+
+    # the budget is returned raw; the caller mins it with the order cap
+    assert vs.hedgeable_qty(call, 0) > vs.OPT_MAX_ORDER
+    # already near the cap -> only a sliver fits, below a full order
+    assert vs.hedgeable_qty(call, 32000) == 60
+    # at the cap -> nothing more in that direction
+    assert vs.hedgeable_qty(call, 35000) == 0
+    # ...but trades that shrink the exposure are unrestricted
+    assert vs.hedgeable_qty(call, -35000) > vs.OPT_MAX_ORDER
+    print("PASS  option_book_capped_to_hedge_capacity")
+
+
 def test_limits_count_legs_that_did_not_price():
     """Deep ITM puts do not invert, and dropping them hid their positions."""
     positions = {"RTM52P": -400, "RTM50C": -200}
@@ -179,15 +224,17 @@ def test_limits_count_legs_that_did_not_price():
     rows = vs.build_signal_table(securities, current_vol=0.25, tick=295)
     legs = vs.option_legs(securities)
 
-    assert len(legs) == 10
-    assert len(rows) < len(legs), "this fixture must actually drop a leg"
+    assert len(legs) == 10 and len(rows) == 10
+    unquotable = [r for r in rows if r["iv_gap"] is None]
+    assert unquotable, "this fixture must actually contain an unquotable leg"
 
-    from_rows = sum(abs(r["position"]) for r in rows)
-    from_legs = sum(abs(x["position"]) for x in legs)
-    assert from_legs == 600
-    assert from_rows < from_legs, "the old accounting understated the book"
+    # limits read positions directly, so they never depended on pricing
+    assert sum(abs(x["position"]) for x in legs) == 600
+    assert vs.option_room(legs)[0] == vs.OPT_GROSS_LIMIT - 600
+    # and the rows now agree with them
+    assert sum(abs(r["position"]) for r in rows) == 600
     print(f"PASS  limits_count_legs_that_did_not_price "
-          f"({len(rows)}/10 priced; gross {from_rows} vs {from_legs})")
+          f"({len(unquotable)} unquotable, all 600 contracts still counted)")
 
 
 def test_option_budget_released_per_week():
