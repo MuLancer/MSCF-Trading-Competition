@@ -164,6 +164,50 @@ def test_option_budget_released_per_week():
     print("PASS  option_budget_released_per_week")
 
 
+def test_forecast_blends_in_next_week():
+    """The real heat that motivated this: week 3 at 35%, week 4 forecast 8-13%."""
+    state = vs.new_vol_state()
+    state["current_vol"] = 0.35
+
+    # before the mid-week announcement there is nothing to blend
+    assert vs.blended_vol(state, 192) == 0.35
+
+    state["next_range"] = (0.08, 0.13)
+    blended = vs.blended_vol(state, 192)
+    # 33 ticks left at 35%, then 75 at ~10.5%, variance-weighted
+    assert 0.20 < blended < 0.23, blended
+    assert blended < state["current_vol"], "must pull toward the coming level"
+
+    # market was quoting ~0.40; the blend turns a thin edge into a wide one
+    assert (0.40 - state["current_vol"]) < 0.06
+    assert (0.40 - blended) > 0.17
+
+    # right at expiry there is no 'after' stretch left to blend
+    assert vs.blended_vol(state, 299) == 0.35
+    print(f"PASS  forecast_blends_in_next_week (0.350 -> {blended:.3f})")
+
+
+def test_confirmation_clears_the_spent_forecast():
+    """A 'this week' announcement supersedes the forecast it confirms."""
+    state = vs.new_vol_state()
+    vs.apply_news_to_state([
+        {"news_id": 6, "headline": "", "body": "volatility of RTM next week will be between 8% and 13%"},
+        {"news_id": 7, "headline": "", "body": "volatility of RTM this week will be 9%"},
+    ], state)
+    assert state["current_vol"] == 0.09
+    assert state["next_range"] is None, "stale forecast would blend a level already here"
+    assert vs.blended_vol(state, 240) == 0.09
+    print("PASS  confirmation_clears_the_spent_forecast")
+
+
+def test_net_budget_released_per_week():
+    assert [vs.net_room_for("SELL", 0, t) for t in (1, 80, 160, 240)] == [250, 500, 750, 1000]
+    # already short the week-one allowance: nothing left to sell, room to buy back
+    assert vs.net_room_for("SELL", -250, tick=1) == 0
+    assert vs.net_room_for("BUY", -250, tick=1) == 500
+    print("PASS  net_budget_released_per_week")
+
+
 def test_order_size_capped_by_delta_impact():
     """A full-size order in a deep-delta option must be cut down."""
     deep_call = {"ticker": "RTM48C", "action": "BUY", "delta": 0.9}
@@ -199,6 +243,31 @@ def test_net_room_is_directional():
     assert vs.net_room_for("SELL", 900) == 1900
     assert vs.net_room_for("SELL", 0) == vs.OPT_NET_LIMIT
     print("PASS  net_room_is_directional")
+
+
+def test_hedge_respects_underlying_limit():
+    """A full RTM leg must not keep firing orders the server will reject."""
+    calls = []
+    original, orig_dry = vs.api_request, vs.DRY_RUN
+    vs.api_request = lambda s, m, e, params=None: calls.append(params) or {}
+    vs.DRY_RUN = False
+    try:
+        # long 49,000 of a 50,000 limit, needs to buy 5,000 more -> only 1,000 fits
+        vs.hedge_delta(None, -5000, rtm_pos=49000)
+        assert sum(c["quantity"] for c in calls) == 1000, calls
+
+        calls.clear()
+        # completely full in that direction -> no order at all
+        assert vs.hedge_delta(None, -5000, rtm_pos=50000) is False
+        assert calls == []
+
+        calls.clear()
+        # ...but selling is still allowed from a long book
+        vs.hedge_delta(None, 5000, rtm_pos=50000)
+        assert sum(c["quantity"] for c in calls) == 5000
+    finally:
+        vs.api_request, vs.DRY_RUN = original, orig_dry
+    print("PASS  hedge_respects_underlying_limit")
 
 
 def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):

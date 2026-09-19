@@ -227,6 +227,10 @@ def apply_news_to_state(items, state):
         scope, value = parsed
         if scope == "this":
             state["current_vol"] = value if isinstance(value, float) else sum(value) / 2
+            # This confirmation is the week the previous forecast was about, so
+            # that forecast is spent. Keeping it would blend a level that has
+            # already arrived into the weeks still ahead.
+            state["next_range"] = None
         else:
             state["next_range"] = value if isinstance(value, tuple) else (value, value)
     return state
@@ -331,6 +335,36 @@ def week_of(tick):
     return min(4, tick // WEEK_TICKS + 1)
 
 
+def blended_vol(state, tick):
+    """Expected average volatility over the option's remaining life.
+
+    Black-Scholes wants the average volatility from now to expiry, not just
+    this week's level. Every option here expires at tick 300, so once the
+    mid-week announcement gives next week's range the back half of that life
+    should be priced off it instead of off a level that is about to change.
+    Variance is additive in time, so the two stretches are weighted by ticks.
+
+    This is where the mid-week forecast earns its keep: it lands around 38
+    ticks before the shift, and until the next confirmation arrives the market
+    maker is still quoting the old level.
+    """
+    remaining = max(TOTAL_TICKS - tick, 1)
+    this_week = state["current_vol"]
+    rng = state.get("next_range")
+    if not rng:
+        return this_week
+
+    boundary = min(week_of(tick) * WEEK_TICKS, TOTAL_TICKS)
+    ticks_before = max(0, min(boundary - tick, remaining))
+    ticks_after = remaining - ticks_before
+    if ticks_after <= 0:
+        return this_week
+
+    next_vol = sum(rng) / 2
+    var = (ticks_before * this_week ** 2 + ticks_after * next_vol ** 2) / remaining
+    return var ** 0.5
+
+
 def option_room(rows, tick=None):
     """Remaining contract headroom -> (gross_room, net_room).
 
@@ -368,15 +402,20 @@ def delta_capped_qty(order, running_delta, max_qty):
     return max(0, min(max_qty, int(allowed)))
 
 
-def net_room_for(action, net_pos):
+def net_room_for(action, net_pos, tick=None):
     """Contracts still addable in this direction under the net contract limit.
 
     The limit is on the signed net, so direction matters: short 900 contracts
     leaves 100 to sell but 1900 to buy. Using abs() for both sides both blocks
     trades that would reduce the position and, worse, lets a second order in
     the same tick reuse headroom the first already spent.
+
+    Like the gross budget this is released a quarter per week. Spending the
+    whole net allowance early pins the book at the limit and leaves nothing
+    for the later shifts, which is exactly when the forecast is most useful.
     """
-    return OPT_NET_LIMIT - net_pos if action == "BUY" else OPT_NET_LIMIT + net_pos
+    cap = OPT_NET_LIMIT if tick is None else OPT_NET_LIMIT * week_of(tick) // 4
+    return cap - net_pos if action == "BUY" else cap + net_pos
 
 
 def portfolio_delta(securities, rows):
@@ -386,12 +425,24 @@ def portfolio_delta(securities, rows):
     return opt_delta + rtm_pos
 
 
-def hedge_delta(session, net_delta):
+def hedge_delta(session, net_delta, rtm_pos=0):
+    """Trim the book back toward flat, within RTM's own position limit.
+
+    The hedge is a position too. Ignoring its limit means the server rejects
+    the order once the underlying leg is full and the delta then goes wholly
+    unhedged -- the one state that reliably costs the fine.
+    """
     if abs(net_delta) <= DELTA_BAND:
         return False
     action = "SELL" if net_delta > 0 else "BUY"
-    return submit_chunked(session, UNDERLYING, action,
-                          int(round(abs(net_delta))), RTM_MAX_ORDER)
+    headroom = (RTM_GROSS_LIMIT - rtm_pos if action == "BUY"
+                else RTM_GROSS_LIMIT + rtm_pos)
+    qty = min(int(round(abs(net_delta))), max(0, int(headroom)))
+    if qty <= 0:
+        print(f"    hedge blocked: RTM at {rtm_pos:,.0f} of {RTM_GROSS_LIMIT:,}; "
+              f"delta {net_delta:,.0f} left unhedged")
+        return False
+    return submit_chunked(session, UNDERLYING, action, qty, RTM_MAX_ORDER)
 
 
 # ------------------------------------------------------------------ main loop
@@ -429,7 +480,8 @@ def main():
                 if securities is None:
                     break
 
-                rows = build_signal_table(securities, vol_state["current_vol"],
+                forecast = blended_vol(vol_state, tick)
+                rows = build_signal_table(securities, forecast,
                                           tick, vol_state["risk_free"])
                 orders = select_trades(rows)
 
@@ -441,7 +493,7 @@ def main():
                 net_pos = sum(r["position"] for r in rows)
                 for o in orders[:MAX_NEW_TRADES_PER_TICK]:
                     room = min(OPT_MAX_ORDER, gross_room,
-                               net_room_for(o["action"], net_pos))
+                               net_room_for(o["action"], net_pos, tick))
                     qty = delta_capped_qty(o, net_delta, room)
                     if qty <= 0:
                         continue
@@ -450,10 +502,12 @@ def main():
                         net_pos += qty if o["action"] == "BUY" else -qty
                         gross_room -= qty
 
-                hedge_delta(session, net_delta)
+                rtm_pos = next(x["position"] for x in securities
+                               if x["ticker"] == UNDERLYING)
+                hedge_delta(session, net_delta, rtm_pos)
 
                 print(f"tick={tick} wk={week_of(tick)} "
-                      f"vol={vol_state['current_vol']:.3f} "
+                      f"vol={vol_state['current_vol']:.3f}->{forecast:.3f} "
                       f"r={vol_state['risk_free']:.3f} "
                       f"delta={net_delta:,.0f} signals={len(orders)} "
                       f"room={max(gross_room, 0)}")
