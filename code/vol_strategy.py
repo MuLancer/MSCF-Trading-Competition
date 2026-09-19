@@ -93,6 +93,9 @@ MAX_NEW_TRADES_PER_TICK = 2
 MIN_EDGE_MULTIPLE = 1.5
 
 WEEK_TICKS = 75              # 4 weeks of 75 ticks; vol shifts at each boundary
+# How many weeks the gross budget takes to be fully released. 4 spreads it a
+# quarter at a time; 1 hands over the whole limit at the open.
+BUDGET_WEEKS = 4
 UNDERLYING = "RTM"
 LOOP_SLEEP = 0.25            # Client buffers for us, so this can be tighter than DMA
 
@@ -434,7 +437,8 @@ def option_room(rows, tick=None):
     """
     gross = sum(abs(r["position"]) for r in rows)
     net = sum(r["position"] for r in rows)
-    cap = OPT_GROSS_LIMIT if tick is None else OPT_GROSS_LIMIT * week_of(tick) // 4
+    cap = (OPT_GROSS_LIMIT if tick is None else
+           OPT_GROSS_LIMIT * min(week_of(tick), BUDGET_WEEKS) // BUDGET_WEEKS)
     return cap - gross, OPT_NET_LIMIT - abs(net)
 
 
@@ -548,7 +552,8 @@ def net_room_for(action, net_pos, tick=None):
     if tick is None:
         cap = OPT_NET_LIMIT
     else:
-        cap = min(OPT_NET_LIMIT, OPT_GROSS_LIMIT * week_of(tick) // 4)
+        cap = min(OPT_NET_LIMIT,
+                  OPT_GROSS_LIMIT * min(week_of(tick), BUDGET_WEEKS) // BUDGET_WEEKS)
     return cap - net_pos if action == "BUY" else cap + net_pos
 
 
