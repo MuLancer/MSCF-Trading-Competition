@@ -711,6 +711,39 @@ def main():
                 print(f"API error: {e}")
                 sleep(1)
 
+        warn_if_leaving_a_live_book(session)
+
+
+def warn_if_leaving_a_live_book(session):
+    """Stopping mid-heat with positions open costs more than anything else.
+
+    Nothing hedges once this process exits, so the delta sits wherever it was
+    and the CRO charges $0.10 a second for every unit past 7,000. One heat was
+    stopped at tick 148 with the book open: the delta parked between -20,000
+    and -35,000 for the remaining 150 ticks and the fine reached $74,309,
+    more than the $65,716 the heat had made.
+
+    This only warns. Flattening automatically would be wrong -- Ctrl+C is also
+    how you stop between heats to change parameters, and the positions there
+    settle by themselves.
+    """
+    try:
+        tick, status = get_case(session)
+        if status != "ACTIVE":
+            return
+        securities = get_securities(session)
+        open_legs = [s for s in securities if s["position"]] if securities else []
+        if not open_legs:
+            return
+        print("\n" + "!" * 68)
+        print(f"  STOPPED AT TICK {tick} WITH {len(open_legs)} POSITIONS STILL OPEN.")
+        print("  Nothing is hedging them now and the delta fine keeps running.")
+        print("  Either restart this script, or close out:")
+        print("      python3 flatten.py --live")
+        print("!" * 68)
+    except Exception:
+        pass        # never let the warning itself break the shutdown
+
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
