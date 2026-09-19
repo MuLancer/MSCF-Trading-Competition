@@ -129,6 +129,39 @@ def test_currency_leg_is_not_optional():
           f"(mid says {naive_cheap:+.4f}, executable says {cheap:+.4f})")
 
 
+def test_converter_makes_a_large_tender_executable():
+    """Without the converter an 83,000 tender cannot be unwound at all."""
+    books = {"RITC": {"bids": RITC_BIDS, "asks": []},
+             "BULL": {"bids": BULL_BIDS, "asks": []},
+             "BEAR": {"bids": BEAR_BIDS, "asks": []}}
+    original = es.fetch_book
+    es.fetch_book = lambda s, t, depth=40: books[t]
+    try:
+        # RITC alone holds 64,110 of the 83,000
+        _, direct_got = es.sweep(RITC_BIDS, 83000)
+        assert direct_got == 64110
+
+        price, lots, stranded = es.unwind_plan(None, BOOK, 83000, buying=True)
+        assert stranded == 0, "routing through the converter must clear it"
+        assert lots > 0, "and it must actually use the converter"
+
+        # the real tender was priced badly and is still refused
+        bad = {"tender_id": 1, "quantity": 83000, "price": 24.49,
+               "action": "BUY", "is_fixed_bid": True}
+        edge, _, _ = es.tender_edge(None, BOOK, bad)
+        assert edge < 0, edge
+
+        # the same size at a fair price is taken
+        good = dict(bad, price=24.00)
+        edge_good, lots_good, stranded_good = es.tender_edge(None, BOOK, good)
+        assert stranded_good == 0
+        assert edge_good > es.TENDER_MARGIN * es.ARB_LEG_COST, edge_good
+        print(f"PASS  converter_makes_a_large_tender_executable "
+              f"({lots} lots; 24.49 gives {edge:+.3f}, 24.00 gives {edge_good:+.3f})")
+    finally:
+        es.fetch_book = original
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

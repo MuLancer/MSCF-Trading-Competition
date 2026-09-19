@@ -75,6 +75,15 @@ ARB_QTY = 5000
 # unwind is the expensive half: it crosses the spread on three legs.
 TENDER_MARGIN = 1.5
 
+# The converters swap 10,000 RITC for 10,000 BULL + 10,000 BEAR (or back) for
+# 1,500 USD, two ticks each. At 0.151 CAD a share that is dearer than the
+# 0.06 of fees, so it is never the cheap route -- it is the route that exists
+# when the route does not. Tenders arrive at 80,000 shares against a RITC
+# book holding 12,200 at the touch; converting spreads the exit across three
+# books instead of one. The API cannot press the button, so a person has to.
+CONVERT_LOT = 10000
+CONVERT_FEE_USD = 1500.0
+
 MAX_POSITION_TICKS = 30      # how long an arb position may sit before unwinding
 LOOP_SLEEP = 0.2
 DRY_RUN = True
@@ -146,6 +155,53 @@ def sweep(levels, qty):
         if taken >= qty:
             break
     return (spend / taken if taken else 0.0), taken
+
+
+def unwind_plan(session, b, qty, buying):
+    """Best way out of `qty` RITC, possibly through the converter.
+
+    Returns (CAD per share realised, lots to convert, shares left stranded).
+    Exiting entirely through one book is what makes a large tender
+    unsellable; routing part of it through the converter uses the BULL and
+    BEAR books as well, which between them hold far more than RITC alone.
+    """
+    ritc = fetch_book(session, RITC)
+    ritc_levels = ritc["bids"] if buying else ritc["asks"]
+    bull = fetch_book(session, BULL)
+    bear = fetch_book(session, BEAR)
+    side = "bids" if buying else "asks"
+    fx = b[USD]["bid"] if buying else b[USD]["ask"]
+    convert_cad = CONVERT_FEE_USD / CONVERT_LOT * b[USD]["ask"]
+
+    best = None
+    for lots in range(0, qty // CONVERT_LOT + 2):
+        via_convert = min(lots * CONVERT_LOT, qty)
+        direct = qty - via_convert
+
+        etf_px, etf_got = sweep(ritc_levels, direct)
+        bull_px, bull_got = sweep(bull[side], via_convert)
+        bear_px, bear_got = sweep(bear[side], via_convert)
+        basket_got = min(bull_got, bear_got)
+
+        placed = etf_got + basket_got
+        if not placed:
+            continue
+        # value is signed: selling realises, buying costs
+        etf_value = etf_px * fx * etf_got
+        basket_value = (bull_px + bear_px) * basket_got
+        cost = convert_cad * basket_got
+        total = (etf_value + basket_value - cost if buying
+                 else etf_value + basket_value + cost)
+        per_share = total / placed
+        score = per_share if buying else -per_share
+        stranded = qty - placed
+        # a plan that strands shares is worse than one that does not
+        ranked = (-stranded, score)
+        if best is None or ranked > best[0]:
+            best = (ranked, per_share, min(lots, basket_got // CONVERT_LOT), stranded)
+    if best is None:
+        return 0.0, 0, qty
+    return best[1], best[2], best[3]
 
 
 def sweep_basket(session, qty, side):
@@ -303,18 +359,9 @@ def tender_edge(session, b, tender):
     price_cad = tender["price"] * b[USD]["bid"]       # tenders quote RITC in USD
     buying = tender["action"].upper() == "BUY"
 
-    basket, basket_short = sweep_basket(session, qty, "sell" if buying else "buy")
-    ladder = fetch_book(session, RITC)
-    etf_usd, etf_got = sweep(ladder["bids"] if buying else ladder["asks"], qty)
-    etf = etf_usd * (b[USD]["bid"] if buying else b[USD]["ask"])
-
-    if buying:
-        exit_value = max(basket, etf)                 # sell whichever pays more
-        shortfall = basket_short if basket >= etf else qty - etf_got
-        return exit_value - price_cad - ARB_LEG_COST, shortfall
-    entry_cost = min(basket, etf) if etf else basket  # buy whichever is cheaper
-    shortfall = basket_short if basket <= etf else qty - etf_got
-    return price_cad - entry_cost - ARB_LEG_COST, shortfall
+    realised, lots, stranded = unwind_plan(session, b, qty, buying)
+    edge = (realised - price_cad if buying else price_cad - realised) - ARB_LEG_COST
+    return edge, lots, stranded
 
 
 def handle_tenders(session, b, weights, caps):
@@ -322,7 +369,7 @@ def handle_tenders(session, b, weights, caps):
     if not tenders:
         return
     for t in tenders:
-        edge, shortfall = tender_edge(session, b, t)
+        edge, lots, shortfall = tender_edge(session, b, t)
         qty = int(t["quantity"])
         floor = TENDER_MARGIN * ARB_LEG_COST
         room = arb_room(b, weights, caps)
@@ -334,6 +381,13 @@ def handle_tenders(session, b, weights, caps):
             continue
         print(f"    tender {t['tender_id']} accepted: {edge:+.3f} CAD/sh "
               f"on {qty:,} -> {edge * qty:,.0f} CAD")
+        if lots:
+            verb = "ETF-Redemption" if t["action"].upper() == "BUY" else "ETF-Creation"
+            print("    " + "*" * 60)
+            print(f"    HUMAN: press {verb} {lots} times in the Assets tab.")
+            print(f"    The plan only works if {lots * CONVERT_LOT:,} shares go")
+            print("    through the converter; the books cannot absorb them.")
+            print("    " + "*" * 60)
         if DRY_RUN:
             continue
         params = None if t.get("is_fixed_bid") else {"price": t["price"]}
