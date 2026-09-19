@@ -105,16 +105,35 @@ def test_fairly_priced_market_generates_no_trades():
 
 
 def test_select_trades_sorted_by_edge():
-    rows = [
-        {"ticker": "A", "iv_gap": 0.03, "delta": 0.5, "position": 0},
-        {"ticker": "B", "iv_gap": -0.09, "delta": -0.5, "position": 0},
-        {"ticker": "C", "iv_gap": 0.06, "delta": 0.4, "position": 0},
-        {"ticker": "D", "iv_gap": 0.001, "delta": 0.3, "position": 0},
+    rows = [   # equal vega, so dollar edge ranks the same as the gap
+        {"ticker": "A", "iv_gap": 0.03, "delta": 0.5, "vega": 0.057, "position": 0},
+        {"ticker": "B", "iv_gap": -0.09, "delta": -0.5, "vega": 0.057, "position": 0},
+        {"ticker": "C", "iv_gap": 0.06, "delta": 0.4, "vega": 0.057, "position": 0},
+        {"ticker": "D", "iv_gap": 0.001, "delta": 0.3, "vega": 0.057, "position": 0},
     ]
     orders = vs.select_trades(rows, threshold=0.02)
     assert [o["ticker"] for o in orders] == ["B", "C", "A"]   # D below threshold
     assert orders[0]["action"] == "BUY"
     print("PASS  select_trades_sorted_by_edge")
+
+
+def test_same_gap_stops_being_tradable_near_expiry():
+    """Vega decays, the $2 commission does not."""
+    early = vs.build_signal_table(make_market(50.0, 0.25, 1), 0.23, 1)
+    late = vs.build_signal_table(make_market(50.0, 0.25, 290), 0.23, 290)
+
+    # identical 2-point mispricing at both ends of the heat
+    assert all(abs(r["iv_gap"] - 0.02) < 1e-4 for r in early + late)
+
+    atm_early = next(r for r in early if r["ticker"] == "RTM50C")
+    atm_late = next(r for r in late if r["ticker"] == "RTM50C")
+    assert vs.expected_edge(atm_early) > 10, vs.expected_edge(atm_early)
+    assert vs.expected_edge(atm_late) < 2 * vs.FEE_OPT, vs.expected_edge(atm_late)
+
+    assert vs.select_trades(early), "should trade a 2-point gap at the open"
+    assert vs.select_trades(late) == [], "same gap grosses less than the round trip"
+    print(f"PASS  same_gap_stops_being_tradable_near_expiry "
+          f"(${vs.expected_edge(atm_early):.2f} -> ${vs.expected_edge(atm_late):.2f}/contract)")
 
 
 def test_atm_deltas_have_expected_sign_and_size():
@@ -147,6 +166,30 @@ def test_option_room():
     print("PASS  option_room")
 
 
+def test_limits_count_legs_that_did_not_price():
+    """Deep ITM puts do not invert, and dropping them hid their positions."""
+    positions = {"RTM52P": -400, "RTM50C": -200}
+    securities = make_market(S=50.0, mm_vol=0.25, tick=295, positions=positions)
+    # At tick 0 the book is not quoted yet, so an in-the-money leg shows a mid
+    # below its intrinsic value and the inversion refuses it.
+    for s in securities:
+        if s["ticker"] == "RTM52P":
+            s["bid"], s["ask"] = 0.0, 0.0
+
+    rows = vs.build_signal_table(securities, current_vol=0.25, tick=295)
+    legs = vs.option_legs(securities)
+
+    assert len(legs) == 10
+    assert len(rows) < len(legs), "this fixture must actually drop a leg"
+
+    from_rows = sum(abs(r["position"]) for r in rows)
+    from_legs = sum(abs(x["position"]) for x in legs)
+    assert from_legs == 600
+    assert from_rows < from_legs, "the old accounting understated the book"
+    print(f"PASS  limits_count_legs_that_did_not_price "
+          f"({len(rows)}/10 priced; gross {from_rows} vs {from_legs})")
+
+
 def test_option_budget_released_per_week():
     """Week one must not be able to spend the whole gross limit."""
     assert [vs.week_of(t) for t in (0, 74, 75, 149, 150, 224, 225, 299)] == \
@@ -162,6 +205,51 @@ def test_option_budget_released_per_week():
     # ...but the next shift releases more
     assert vs.option_room(held, tick=80)[0] == 625
     print("PASS  option_budget_released_per_week")
+
+
+def test_state_is_unseeded_until_news_arrives():
+    """Never price off the placeholder volatility."""
+    state = vs.new_vol_state()
+    assert state["seeded"] is False
+    assert state["last_news_id"] == 0
+
+    vs.apply_news_to_state(
+        [{"news_id": 1, "headline": "", "body": "no numbers here"}], state)
+    assert state["seeded"] is False, "unparseable news must not count as seeded"
+
+    vs.apply_news_to_state(
+        [{"news_id": 2, "headline": "", "body": "volatility this week will be 19%"}], state)
+    assert state["seeded"] is True and state["current_vol"] == 0.19
+    print("PASS  state_is_unseeded_until_news_arrives")
+
+
+def test_stale_cursor_would_swallow_a_new_heat():
+    """Why the heat reset exists: news_id restarts at 1 every heat.
+
+    Carrying the previous heat's cursor makes get_new_news ask for ids greater
+    than one the new heat has not reached yet, so every announcement up to it
+    is filtered out and the whole heat prices off the last heat's final level.
+    """
+    fresh_heat = [
+        {"news_id": i, "headline": "", "body": b}
+        for i, b in enumerate(
+            ["risk free rate is 0%. realized volatility is 19%",
+             "volatility next week will be between 21% and 26%",
+             "volatility this week will be 24%"], start=1)
+    ]
+    carried = vs.new_vol_state()
+    carried["last_news_id"] = 6            # left over from the previous heat
+    carried["current_vol"] = 0.09          # that heat's final level
+
+    survivors = [n for n in fresh_heat if n["news_id"] > carried["last_news_id"]]
+    assert survivors == [], "the stale cursor drops the entire heat"
+
+    reset = vs.new_vol_state()
+    kept = [n for n in fresh_heat if n["news_id"] > reset["last_news_id"]]
+    assert len(kept) == 3
+    vs.apply_news_to_state(kept, reset)
+    assert reset["current_vol"] == 0.24 and reset["seeded"]
+    print("PASS  stale_cursor_would_swallow_a_new_heat")
 
 
 def test_forecast_blends_in_next_week():
@@ -243,6 +331,41 @@ def test_net_room_is_directional():
     assert vs.net_room_for("SELL", 900) == 1900
     assert vs.net_room_for("SELL", 0) == vs.OPT_NET_LIMIT
     print("PASS  net_room_is_directional")
+
+
+def test_emergency_unwind_cuts_the_offending_leg():
+    """When the hedge is maxed out, shrink the options instead of paying."""
+    calls = []
+    original, orig_dry = vs.api_request, vs.DRY_RUN
+    vs.api_request = lambda s, m, e, params=None: calls.append(params) or {}
+    vs.DRY_RUN = False
+    try:
+        rows = [
+            {"ticker": "RTM48C", "delta": 0.9, "position": 400},   # +36,000
+            {"ticker": "RTM52P", "delta": -0.8, "position": 50},   # -4,000
+            {"ticker": "RTM50C", "delta": 0.5, "position": 20},    # +1,000
+        ]
+        # inside the fine threshold -> leave it alone
+        assert vs.emergency_unwind(None, rows, 5000) is False and not calls
+
+        vs.emergency_unwind(None, rows, 32000)
+        assert len(calls) == 1
+        assert calls[0]["ticker"] == "RTM48C", "must cut the biggest offender"
+        assert calls[0]["action"] == "SELL", "long leg, positive delta -> sell"
+
+        calls.clear()
+        # long puts breaching downward: selling them lifts delta back up
+        short_rows = [{"ticker": "RTM48P", "delta": -0.9, "position": 400}]
+        vs.emergency_unwind(None, short_rows, -32000)
+        assert calls[0]["ticker"] == "RTM48P" and calls[0]["action"] == "SELL"
+
+        calls.clear()
+        # nothing pushing the same way -> nothing to cut
+        assert vs.emergency_unwind(None, short_rows, +32000) is False
+        assert calls == []
+    finally:
+        vs.api_request, vs.DRY_RUN = original, orig_dry
+    print("PASS  emergency_unwind_cuts_the_offending_leg")
 
 
 def test_hedge_respects_underlying_limit():

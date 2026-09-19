@@ -18,6 +18,7 @@ from time import sleep
 
 import requests
 from py_vollib.black_scholes.greeks.analytical import delta as bs_delta
+from py_vollib.black_scholes.greeks.analytical import vega as bs_vega
 from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_iv
 
 # ---------------------------------------------------------------- connection
@@ -79,6 +80,10 @@ MAX_TICK_DELTA = 3000        # most delta one tick's option orders may leave
 DELTA_BAND = 2500            # hedge trigger; below this, drift is left alone
 IV_GAP_THRESHOLD = 0.02      # min |market_iv - forecast| to trade; tune this
 MAX_NEW_TRADES_PER_TICK = 2
+# Required gross edge per contract, counted in round-trip commissions. Vega
+# decays with sqrt(time left) while the commission does not, so this is what
+# stops the last stretch of the heat from trading at a loss.
+MIN_EDGE_MULTIPLE = 1.5
 
 WEEK_TICKS = 75              # 4 weeks of 75 ticks; vol shifts at each boundary
 UNDERLYING = "RTM"
@@ -178,8 +183,10 @@ RF_RE = re.compile(
 
 
 def new_vol_state(initial_vol=0.20):
+    # `seeded` stays False until a real announcement has been read. Trading
+    # before that prices every option off a guessed level.
     return {"current_vol": initial_vol, "next_range": None,
-            "risk_free": RISK_FREE, "last_news_id": 0}
+            "risk_free": RISK_FREE, "last_news_id": 0, "seeded": False}
 
 
 def get_new_news(session, last_news_id):
@@ -225,6 +232,7 @@ def apply_news_to_state(items, state):
         if parsed is None:
             continue
         scope, value = parsed
+        state["seeded"] = True
         if scope == "this":
             state["current_vol"] = value if isinstance(value, float) else sum(value) / 2
             # This confirmation is the week the previous forecast was about, so
@@ -286,14 +294,34 @@ def build_signal_table(securities, current_vol, tick, risk_free=RISK_FREE):
             "market_iv": market_iv,
             "iv_gap": market_iv - current_vol,
             "delta": bs_delta(right, S, K, T, risk_free, current_vol),
+            "vega": bs_vega(right, S, K, T, risk_free, current_vol),
         })
     return rows
 
 
+def expected_edge(row):
+    """Gross dollars per contract from the mispricing, before commission.
+
+    py_vollib reports vega per share per volatility point, so a contract is
+    100x that and iv_gap has to be read in points rather than absolute units.
+    """
+    return abs(row["iv_gap"]) * row["vega"] * 10000
+
+
 def select_trades(rows, threshold=IV_GAP_THRESHOLD):
-    """iv_gap > 0 means the option is rich -> SELL. Sorted by |iv_gap| desc."""
-    picks = [r for r in rows if abs(r["iv_gap"]) > threshold]
-    picks.sort(key=lambda r: abs(r["iv_gap"]), reverse=True)
+    """iv_gap > 0 means the option is rich -> SELL. Sorted by dollar edge.
+
+    A volatility gap is not worth the same everywhere. Vega falls with the
+    square root of time left while the $2 commission does not, so by the last
+    fifty ticks the standard two-point gap grosses less than the round trip
+    costs: $2.10 against $4.00 at tick 290. Screening on dollars instead of
+    vol points tightens the bar automatically as expiry approaches, and ranks
+    by what each trade actually earns rather than by how mispriced it looks.
+    """
+    floor = MIN_EDGE_MULTIPLE * 2 * FEE_OPT
+    picks = [r for r in rows
+             if abs(r["iv_gap"]) > threshold and expected_edge(r) > floor]
+    picks.sort(key=expected_edge, reverse=True)
     return [{"ticker": r["ticker"],
              "action": "SELL" if r["iv_gap"] > 0 else "BUY",
              "iv_gap": r["iv_gap"],
@@ -328,6 +356,17 @@ def submit_chunked(session, ticker, action, qty, max_size):
             return False
         remaining -= lot
     return True
+
+
+def option_legs(securities):
+    """Every option leg, whether or not its implied volatility inverted.
+
+    The signal table drops legs whose quote will not invert -- deep in- or
+    out-of-the-money ones, which near expiry is most of them. Counting the
+    position limits off that table hides those legs' positions, so the book
+    looks smaller than it is and the server rejects the next order.
+    """
+    return [s for s in securities if parse_option_ticker(s["ticker"])]
 
 
 def week_of(tick):
@@ -418,6 +457,35 @@ def net_room_for(action, net_pos, tick=None):
     return cap - net_pos if action == "BUY" else cap + net_pos
 
 
+def emergency_unwind(session, rows, net_delta):
+    """Shrink the option leg carrying the most offending delta.
+
+    This is the stop-loss that matters here. A mark-to-market stop would cut
+    positions that are usually right but early, since the edge only pays as
+    the market maker converges. The fine is the loss that is certain: $0.10
+    per second per unit over 7,000, so a book sitting at 30,000 burns $2,300
+    a second. Once the underlying leg is at its own limit the hedge cannot
+    help, and the only way out is to carry fewer options.
+    """
+    if abs(net_delta) <= DELTA_HARD_LIMIT:
+        return False
+    # the leg whose delta pushes the same way as the breach, largest first
+    offenders = [r for r in rows
+                 if r["position"] and
+                 (r["delta"] * r["position"]) * net_delta > 0]
+    if not offenders:
+        return False
+    worst = max(offenders, key=lambda r: abs(r["delta"] * r["position"]))
+    excess = abs(net_delta) - DELTA_BAND
+    per_contract = abs(worst["delta"]) * CONTRACT_SIZE
+    qty = min(abs(worst["position"]), OPT_MAX_ORDER,
+              max(1, int(excess / max(per_contract, 1e-9))))
+    action = "SELL" if worst["position"] > 0 else "BUY"
+    print(f"    delta {net_delta:,.0f} past the fine line; "
+          f"cutting {qty} {worst['ticker']}")
+    return place_order(session, worst["ticker"], action, qty)
+
+
 def portfolio_delta(securities, rows):
     """Option delta x 100 x position, plus the RTM share position."""
     rtm_pos = next(s["position"] for s in securities if s["ticker"] == UNDERLYING)
@@ -472,6 +540,14 @@ def main():
                     sleep(LOOP_SLEEP)
                     tick, status = get_case(session)
                     continue
+
+                # A heat restarts news_id at 1, so the cursor carried over from
+                # the previous heat filters out every announcement whose id it
+                # already passed. That silently ran a whole heat on the last
+                # heat's final volatility. A tick going backwards is the signal.
+                if last_tick is not None and tick < last_tick:
+                    print(f"new heat (tick {last_tick} -> {tick}); resetting state")
+                    vol_state = new_vol_state()
                 last_tick = tick
 
                 update_vol_state(session, vol_state)
@@ -480,17 +556,25 @@ def main():
                 if securities is None:
                     break
 
+                if not vol_state["seeded"]:
+                    print(f"tick={tick} waiting for the opening announcement")
+                    sleep(LOOP_SLEEP)
+                    tick, status = get_case(session)
+                    continue
+
                 forecast = blended_vol(vol_state, tick)
                 rows = build_signal_table(securities, forecast,
                                           tick, vol_state["risk_free"])
                 orders = select_trades(rows)
 
-                gross_room, _ = option_room(rows, tick)
+                # Limits count every leg, not just the ones that priced.
+                legs = option_legs(securities)
+                gross_room, _ = option_room(legs, tick)
                 # Track delta and both limits as the orders go in: fills will
                 # not show up in /securities before the next order is sized or
                 # the hedge is placed, all within this same tick.
                 net_delta = portfolio_delta(securities, rows)
-                net_pos = sum(r["position"] for r in rows)
+                net_pos = sum(x["position"] for x in legs)
                 for o in orders[:MAX_NEW_TRADES_PER_TICK]:
                     room = min(OPT_MAX_ORDER, gross_room,
                                net_room_for(o["action"], net_pos, tick))
@@ -504,7 +588,12 @@ def main():
 
                 rtm_pos = next(x["position"] for x in securities
                                if x["ticker"] == UNDERLYING)
-                hedge_delta(session, net_delta, rtm_pos)
+                hedged = hedge_delta(session, net_delta, rtm_pos)
+                if not hedged:
+                    # Either inside the band, or the underlying leg is full.
+                    # Only the second case is dangerous, and it is the one
+                    # where the delta stays past the fine line.
+                    emergency_unwind(session, rows, net_delta)
 
                 print(f"tick={tick} wk={week_of(tick)} "
                       f"vol={vol_state['current_vol']:.3f}->{forecast:.3f} "
