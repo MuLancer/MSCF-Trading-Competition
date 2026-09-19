@@ -71,7 +71,12 @@ FEE_RTM = 0.02               # per share
 FEE_OPT = 2.00               # per contract
 
 DELTA_HARD_LIMIT = 7000      # CRO fine threshold
-DELTA_BAND = 5000            # our own hedge trigger; tune this
+# These two must not be equal. Sizing orders up to the same number that
+# triggers the hedge pins the book just under the trigger, so the hedge never
+# fires and the delta is carried naked all heat. Keep the sizing cap above the
+# hedge trigger so a tick that takes a position is then flattened.
+MAX_TICK_DELTA = 3000        # most delta one tick's option orders may leave
+DELTA_BAND = 2500            # hedge trigger; below this, drift is left alone
 IV_GAP_THRESHOLD = 0.02      # min |market_iv - forecast| to trade; tune this
 MAX_NEW_TRADES_PER_TICK = 2
 
@@ -298,9 +303,16 @@ def place_order(session, ticker, action, qty):
     if DRY_RUN:
         print(f"    [DRY] {action:4} {int(qty):>6} {ticker}")
         return True
-    resp = api_request(session, "POST", "orders",
-                       params={"ticker": ticker, "type": "MARKET",
-                               "quantity": int(qty), "action": action})
+    try:
+        resp = api_request(session, "POST", "orders",
+                           params={"ticker": ticker, "type": "MARKET",
+                                   "quantity": int(qty), "action": action})
+    except ApiException as e:
+        # A rejected order (risk limits, tick boundary) must not abort the
+        # tick: the hedge runs after this and skipping it leaves the delta
+        # exposed for a whole tick.
+        print(f"    order rejected {action} {int(qty)} {ticker}: {str(e)[-90:]}")
+        return False
     return resp is not None
 
 
@@ -332,6 +344,39 @@ def option_room(rows, tick=None):
     net = sum(r["position"] for r in rows)
     cap = OPT_GROSS_LIMIT if tick is None else OPT_GROSS_LIMIT * week_of(tick) // 4
     return cap - gross, OPT_NET_LIMIT - abs(net)
+
+
+def order_delta(order, qty):
+    """Share-delta that filling this order adds to the book."""
+    sign = 1 if order["action"] == "BUY" else -1
+    return sign * qty * CONTRACT_SIZE * order["delta"]
+
+
+def delta_capped_qty(order, running_delta, max_qty):
+    """Largest size whose delta impact still leaves the book inside the band.
+
+    Sizing on the contract limit alone let one tick add 8,000-13,000 of delta
+    against a 7,000 fine threshold: the book blew through the limit and the
+    hedge had to undo it immediately, paying the spread in both directions.
+    Size the option leg so the hedge is a trim rather than a reversal.
+    """
+    per_contract = order_delta(order, 1)
+    if per_contract == 0:
+        return max_qty
+    edge = MAX_TICK_DELTA if per_contract > 0 else -MAX_TICK_DELTA
+    allowed = (edge - running_delta) / per_contract
+    return max(0, min(max_qty, int(allowed)))
+
+
+def net_room_for(action, net_pos):
+    """Contracts still addable in this direction under the net contract limit.
+
+    The limit is on the signed net, so direction matters: short 900 contracts
+    leaves 100 to sell but 1900 to buy. Using abs() for both sides both blocks
+    trades that would reduce the position and, worse, lets a second order in
+    the same tick reuse headroom the first already spent.
+    """
+    return OPT_NET_LIMIT - net_pos if action == "BUY" else OPT_NET_LIMIT + net_pos
 
 
 def portfolio_delta(securities, rows):
@@ -388,18 +433,23 @@ def main():
                                           tick, vol_state["risk_free"])
                 orders = select_trades(rows)
 
-                gross_room, net_room = option_room(rows, tick)
-                pending_delta = 0.0
+                gross_room, _ = option_room(rows, tick)
+                # Track delta and both limits as the orders go in: fills will
+                # not show up in /securities before the next order is sized or
+                # the hedge is placed, all within this same tick.
+                net_delta = portfolio_delta(securities, rows)
+                net_pos = sum(r["position"] for r in rows)
                 for o in orders[:MAX_NEW_TRADES_PER_TICK]:
-                    qty = min(OPT_MAX_ORDER, gross_room, net_room)
+                    room = min(OPT_MAX_ORDER, gross_room,
+                               net_room_for(o["action"], net_pos))
+                    qty = delta_capped_qty(o, net_delta, room)
                     if qty <= 0:
-                        break
+                        continue
                     if place_order(session, o["ticker"], o["action"], qty):
-                        sign = 1 if o["action"] == "BUY" else -1
-                        pending_delta += sign * qty * CONTRACT_SIZE * o["delta"]
+                        net_delta += order_delta(o, qty)
+                        net_pos += qty if o["action"] == "BUY" else -qty
                         gross_room -= qty
 
-                net_delta = portfolio_delta(securities, rows) + pending_delta
                 hedge_delta(session, net_delta)
 
                 print(f"tick={tick} wk={week_of(tick)} "

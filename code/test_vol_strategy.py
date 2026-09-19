@@ -164,6 +164,43 @@ def test_option_budget_released_per_week():
     print("PASS  option_budget_released_per_week")
 
 
+def test_order_size_capped_by_delta_impact():
+    """A full-size order in a deep-delta option must be cut down."""
+    deep_call = {"ticker": "RTM48C", "action": "BUY", "delta": 0.9}
+
+    # flat book: 100 contracts would add 9,000 delta, past the 5,000 band
+    qty = vs.delta_capped_qty(deep_call, running_delta=0, max_qty=100)
+    assert qty == 33, qty
+    assert abs(vs.order_delta(deep_call, qty)) <= vs.MAX_TICK_DELTA
+
+    # already leaning the same way -> much less room
+    qty = vs.delta_capped_qty(deep_call, running_delta=2000, max_qty=100)
+    assert qty == 11, qty
+    assert 2000 + vs.order_delta(deep_call, qty) <= vs.MAX_TICK_DELTA
+
+    # already past the band in that direction -> add nothing
+    assert vs.delta_capped_qty(deep_call, running_delta=3500, max_qty=100) == 0
+
+    # an order that pulls delta back toward zero is not restricted
+    assert vs.delta_capped_qty(deep_call, running_delta=-6000, max_qty=100) == 100
+
+    # selling flips the sign, so the same option is capped on the short side
+    short_call = dict(deep_call, action="SELL")
+    qty = vs.delta_capped_qty(short_call, running_delta=0, max_qty=100)
+    assert qty == 33 and vs.order_delta(short_call, qty) < 0
+    print("PASS  order_size_capped_by_delta_impact")
+
+
+def test_net_room_is_directional():
+    """Short 900 leaves 100 to sell but 1900 to buy."""
+    assert vs.net_room_for("SELL", -900) == 100
+    assert vs.net_room_for("BUY", -900) == 1900
+    assert vs.net_room_for("BUY", 900) == 100
+    assert vs.net_room_for("SELL", 900) == 1900
+    assert vs.net_room_for("SELL", 0) == vs.OPT_NET_LIMIT
+    print("PASS  net_room_is_directional")
+
+
 def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):
     calls = []
 
@@ -176,12 +213,14 @@ def test_hedge_delta_respects_band_and_chunks(monkeypatched=None):
     vs.api_request = fake_api_request
     vs.DRY_RUN = False          # exercise the real order path, not the dry-run stub
     try:
-        assert vs.hedge_delta(None, 4000) is False and not calls    # inside band
-        assert vs.hedge_delta(None, -4999) is False and not calls
+        inside = vs.DELTA_BAND - 1
+        assert vs.hedge_delta(None, inside) is False and not calls
+        assert vs.hedge_delta(None, -inside) is False and not calls
 
-        vs.hedge_delta(None, 6000)                                  # long -> sell
+        over = vs.DELTA_BAND + 1000
+        vs.hedge_delta(None, over)                                  # long -> sell
         assert len(calls) == 1
-        assert calls[0]["action"] == "SELL" and calls[0]["quantity"] == 6000
+        assert calls[0]["action"] == "SELL" and calls[0]["quantity"] == over
 
         calls.clear()
         vs.hedge_delta(None, -25000)                                # chunked at 10k
