@@ -179,7 +179,23 @@ Ctrl+C 退出。未平仓位按最后成交价自动结算，不用手动平。
 | delta 一直超限 | 对冲单被拒或没成交 | Ctrl+C，Client 里手动平 |
 | 完全不下单 | 阈值太高，或 `DRY_RUN` 忘了关 | 查 `DRY_RUN`，再看 `signals=` |
 
-**兜底永远是 Ctrl+C + 在 RIT Client 里手动平仓。** Client 一直开着，人工随时能接管。
+### 紧急平仓
+
+出事要立刻清空仓位时，**不要在 Client 里一条条手点**——开另一个命令行窗口：
+
+```
+cd MSCF-Trading-Competition\code
+python flatten.py            # 先看它要做什么，不发单
+python flatten.py --live     # 确认后执行
+```
+
+会按 ticker 自动拆单（期权 100 张/笔、RTM 10,000 股/笔），完成后复查是否真的清零。
+连接配置跟主脚本共用，不用重复填。
+
+> **到期时不需要跑这个。** 期权按内在价值自动现金结算、RTM 按最后成交价自动平仓，
+> 主动去平只是白付手续费和点差。这个脚本是给"出事了要马上撤"和"清掉练习仓位"用的。
+
+**最终兜底是 Ctrl+C + `python flatten.py --live`。** Client 一直开着，人工也随时能接管。
 
 ---
 
